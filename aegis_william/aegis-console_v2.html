@@ -1,0 +1,2069 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AEGIS — Airspace Classification Console | EKCH</title>
+
+<!--
+===============================================================================
+  AEGIS — Airspace Classification Console
+  Prototype UI for a multi-sensor drone identification system.
+  Copenhagen Airport / Kastrup (EKCH) reference installation.
+===============================================================================
+
+  INTEGRATION POINT FOR THE MODEL TEAM
+  ------------------------------------
+  The entire interface is driven by ONE function:
+
+      ingestTrackUpdate(payload)
+
+  Call it once per track, per update. Everything else (map, list, detail
+  panel, threat escalation, event log) reacts automatically. To go live,
+  delete the simulator at the bottom of this file and pipe your model's
+  output into that function via fetch/WebSocket.
+
+  EXPECTED PAYLOAD SHAPE — every field except track_id and timestamp may be
+  null or omitted; the UI degrades to "NO DATA" rather than breaking.
+
+  {
+    "track_id": "UAS-0421",
+    "timestamp": 1755500000.0,              // unix seconds
+    "classification": {
+      "label": "drone",                     // drone|aircraft|helicopter|bird|clutter|unknown
+      "confidence": 0.87,                   // 0..1, confidence in the label
+      "distribution": {                     // should sum to ~1.0
+        "drone": 0.87, "bird": 0.06, "aircraft": 0.02,
+        "helicopter": 0.01, "clutter": 0.02, "unknown": 0.02
+      }
+    },
+    "kinematics": {
+      "lat": 55.6421, "lon": 12.6702,
+      "alt_m": 118, "speed_ms": 21.4,
+      "heading_deg": 214, "vertical_rate_ms": -1.8
+    },
+    "identity": {
+      "remote_id": null,                    // null = no broadcast ID received
+      "operator": null,
+      "model": "DJI Matrice 300 RTK",       // from EO/IR classifier
+      "est_mass_kg": 3.6
+    },
+    "sensors": {                            // per-sensor read on THIS track
+      "radar":    { "detected": true,  "confidence": 0.91, "note": "micro-doppler: rotary" },
+      "acoustic": { "detected": true,  "confidence": 0.74, "note": "4-rotor signature" },
+      "eo_ir":    { "detected": true,  "confidence": 0.88, "note": "airframe matched" },
+      "rf":       { "detected": false, "confidence": 0.0,  "note": "no Remote ID broadcast" }
+    },
+    "flags": ["no_remote_id", "erratic_kinematics", "restricted_airspace"],
+    "threat": null                          // optional override: nominal|monitor|elevated|critical
+  }                                         // if null, the UI derives it from flags + class
+
+  Recognised flags: no_remote_id, erratic_kinematics, restricted_airspace,
+  rapid_descent, loitering, swarm_member, approach_path_conflict.
+  Unknown flags are displayed verbatim and treated as advisory.
+===============================================================================
+-->
+
+<script src="radar_scenarios.js"></script>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=B612:ital,wght@0,400;0,700;1,400&family=B612+Mono:wght@400;700&family=Saira+Condensed:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+<style>
+:root{
+  /* ---- base: neutral graphite, so every hue on screen carries meaning ---- */
+  --void:#08090B;
+  --panel:#101114;
+  --panel-hi:#16181C;
+  --panel-lift:#1E2127;
+  --line:#282C33;
+  --line-soft:#191B1F;
+
+  --ink:#F0F2F5;
+  --dim:#99A0AC;
+  --faint:#5D6470;
+
+  --water:#0A0C10;
+  --land:#13161B;
+  --coast:#333C49;
+  --tarmac:#525C6B;
+
+  /* class colours — spread across the wheel so no two read alike at 20 px */
+  --c-aircraft:#35D9F0;   /* cooperative fixed wing  */
+  --c-helicopter:#6C8CFF; /* cooperative rotary      */
+  --c-drone:#FF3FA4;      /* the thing being hunted  */
+  --c-bird:#A6E22E;       /* biological              */
+  --c-clutter:#6E7480;    /* deliberately dull       */
+  --c-unknown:#B36BFF;    /* unresolved              */
+
+  /* threat ramp — warm only, and nominal deliberately says nothing */
+  --t-nominal:#58606E;
+  --t-monitor:#E8C547;
+  --t-elevated:#FF7A29;
+  --t-critical:#FF2D4E;
+
+  /* equipment health, used nowhere else */
+  --ok:#3FD98B;
+
+  /* restricted airspace: blue hatch, per aeronautical chart convention */
+  --airspace:#4C7FD6;
+
+  /* B612 was commissioned by Airbus for cockpit displays; Saira Condensed
+     carries the DIN lineage of airfield and military signage. */
+  --font-display:'Saira Condensed','Arial Narrow',sans-serif;
+  --font-body:'B612','Segoe UI',system-ui,-apple-system,sans-serif;
+  --font-mono:'B612 Mono',ui-monospace,'SF Mono',Menlo,monospace;
+}
+
+body.theme-light{
+  --void:#E6ECF2;
+  --panel:#FFFFFF;
+  --panel-hi:#F3F6FA;
+  --panel-lift:#E5EBF2;
+  --line:#C8D3E0;
+  --line-soft:#DEE5EE;
+
+  --ink:#11161F;
+  --dim:#424C5C;
+  --faint:#717D90;
+
+  --water:#D6E3F0;
+  --land:#E9EFF5;
+  --coast:#9AB0C9;
+  --tarmac:#6D7B91;
+
+  /* High contrast class colours for light mode */
+  --c-aircraft:#007D99;
+  --c-helicopter:#184BD9;
+  --c-drone:#D90B6C;
+  --c-bird:#387F00;
+  --c-clutter:#5A6372;
+  --c-unknown:#7C2DDB;
+
+  /* Threat ramp */
+  --t-nominal:#5A6372;
+  --t-monitor:#A87800;
+  --t-elevated:#D65600;
+  --t-critical:#D91438;
+
+  --ok:#0E9955;
+  --airspace:#2558BA;
+}
+
+body.theme-light .alertbar.lvl-critical{background:linear-gradient(90deg,rgba(217,20,56,.14),rgba(217,20,56,.02))}
+body.theme-light .alertbar.lvl-elevated{background:linear-gradient(90deg,rgba(214,86,0,.12),transparent)}
+body.theme-light .map-btn{background:rgba(255,255,255,0.85);color:var(--dim)}
+body.theme-light .map-btn:hover{background:var(--panel-hi);color:var(--ink)}
+body.theme-light .map-btn.active{background:rgba(0,125,153,0.12);color:var(--c-aircraft);border-color:var(--c-aircraft)}
+body.theme-light .leaflet-control-attribution{background:rgba(255,255,255,0.85) !important}
+body.theme-light .leaflet-control-attribution a{color:var(--dim) !important}
+
+/* Light mode threat row backgrounds */
+body.theme-light .trow.thr-critical{
+  background:linear-gradient(90deg, rgba(217, 20, 56, 0.15) 0%, rgba(217, 20, 56, 0.03) 100%);
+}
+body.theme-light .trow.thr-critical:hover{
+  background:linear-gradient(90deg, rgba(217, 20, 56, 0.23) 0%, rgba(217, 20, 56, 0.06) 100%);
+}
+body.theme-light .trow.thr-critical.sel{
+  background:linear-gradient(90deg, rgba(217, 20, 56, 0.32) 0%, rgba(217, 20, 56, 0.10) 100%);
+}
+
+body.theme-light .trow.thr-elevated{
+  background:linear-gradient(90deg, rgba(214, 86, 0, 0.13) 0%, rgba(214, 86, 0, 0.03) 100%);
+}
+body.theme-light .trow.thr-elevated:hover{
+  background:linear-gradient(90deg, rgba(214, 86, 0, 0.20) 0%, rgba(214, 86, 0, 0.05) 100%);
+}
+body.theme-light .trow.thr-elevated.sel{
+  background:linear-gradient(90deg, rgba(214, 86, 0, 0.28) 0%, rgba(214, 86, 0, 0.08) 100%);
+}
+
+body.theme-light .trow.thr-monitor{
+  background:linear-gradient(90deg, rgba(168, 120, 0, 0.10) 0%, rgba(168, 120, 0, 0.02) 100%);
+}
+body.theme-light .trow.thr-monitor:hover{
+  background:linear-gradient(90deg, rgba(168, 120, 0, 0.16) 0%, rgba(168, 120, 0, 0.04) 100%);
+}
+body.theme-light .trow.thr-monitor.sel{
+  background:linear-gradient(90deg, rgba(168, 120, 0, 0.24) 0%, rgba(168, 120, 0, 0.07) 100%);
+}
+
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  background:var(--void);
+  color:var(--ink);
+  font-family:var(--font-body);
+  font-size:13px;
+  overflow:hidden;
+  -webkit-font-smoothing:antialiased;
+}
+
+/* ============================ shell ============================ */
+.shell{
+  display:grid;
+  grid-template-columns:326px minmax(0,1fr) 372px;
+  grid-template-rows:auto auto minmax(0,1fr) auto;
+  height:100vh;
+  gap:1px;
+  background:var(--line-soft);
+}
+.masthead{grid-column:1/-1}
+.alertbar{grid-column:1/-1}
+.sensorbar{grid-column:1/-1}
+
+/* ============================ masthead ============================ */
+.masthead{
+  background:var(--panel);
+  display:flex;align-items:center;gap:22px;
+  padding:0 18px;height:52px;
+  border-bottom:1px solid var(--line);
+}
+.brand{display:flex;align-items:baseline;gap:10px}
+.brand h1{
+  font-family:var(--font-display);
+  font-size:24px;font-weight:700;letter-spacing:.14em;
+  color:var(--ink);
+}
+.brand .sub{
+  font-family:var(--font-display);
+  font-size:12px;letter-spacing:.18em;color:var(--faint);
+  text-transform:uppercase;
+}
+.masthead .station{
+  font-family:var(--font-display);
+  font-size:13px;letter-spacing:.14em;color:var(--dim);
+  padding-left:22px;border-left:1px solid var(--line);
+  text-transform:uppercase;
+}
+.masthead .spacer{flex:1}
+.readout{display:flex;flex-direction:column;align-items:flex-end;line-height:1.15}
+.readout .k{font-family:var(--font-display);font-size:10.5px;letter-spacing:.18em;color:var(--faint);text-transform:uppercase}
+.readout .v{font-family:var(--font-mono);font-size:15px;font-weight:700;letter-spacing:.02em}
+
+.chip{
+  font-family:var(--font-display);
+  font-size:11px;letter-spacing:.16em;text-transform:uppercase;
+  padding:5px 10px;border:1px solid currentColor;border-radius:2px;
+  color:var(--t-elevated);
+}
+.btn{
+  font-family:var(--font-display);
+  font-size:12px;letter-spacing:.14em;text-transform:uppercase;
+  background:transparent;color:var(--dim);
+  border:1px solid var(--line);border-radius:2px;
+  padding:6px 12px;cursor:pointer;
+  transition:color .15s,border-color .15s,background .15s;
+}
+.btn:hover{color:var(--ink);border-color:var(--faint);background:var(--panel-hi)}
+.btn:focus-visible{outline:2px solid var(--c-aircraft);outline-offset:2px}
+
+/* ============================ alert bar ============================ */
+.alertbar{
+  background:var(--panel);
+  border-bottom:1px solid var(--line);
+  height:46px;display:flex;align-items:center;gap:16px;padding:0 18px;
+  overflow:hidden;
+}
+.alertbar.quiet{color:var(--faint)}
+.alertbar .beacon{
+  width:9px;height:9px;border-radius:50%;background:currentColor;flex:none;
+}
+.alertbar .headline{
+  font-family:var(--font-display);
+  font-size:17px;letter-spacing:.1em;text-transform:uppercase;font-weight:600;
+}
+.alertbar .detail{font-size:12px;color:var(--dim);flex:1;min-width:0;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.alertbar.lvl-critical{color:var(--t-critical);background:linear-gradient(90deg,rgba(255,45,78,.16),rgba(255,45,78,.02))}
+.alertbar.lvl-elevated{color:var(--t-elevated);background:linear-gradient(90deg,rgba(255,122,41,.12),transparent)}
+.alertbar.lvl-monitor{color:var(--t-monitor)}
+.alertbar.live .beacon{animation:pulse 1.05s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1;box-shadow:0 0 0 0 currentColor}50%{opacity:.35;box-shadow:0 0 0 7px transparent}}
+
+/* ============================ panels ============================ */
+.col{background:var(--panel);display:flex;flex-direction:column;min-height:0;min-width:0}
+.phead{
+  display:flex;align-items:center;gap:10px;
+  padding:11px 14px 9px;border-bottom:1px solid var(--line);flex:none;
+}
+.phead h2{
+  font-family:var(--font-display);
+  font-size:12.5px;letter-spacing:.2em;text-transform:uppercase;
+  color:var(--dim);font-weight:600;
+}
+.phead .count{
+  font-family:var(--font-mono);font-size:11px;color:var(--faint);margin-left:auto;
+}
+
+/* ---------------------------- track list ---------------------------- */
+.tracklist{overflow-y:auto;flex:1;min-height:0}
+.trow{
+  display:grid;grid-template-columns:30px 1fr auto;gap:10px;align-items:center;
+  padding:9px 14px 9px 11px;
+  border-bottom:1px solid var(--line-soft);
+  border-left:3px solid transparent;
+  cursor:pointer;position:relative;
+  transition:background .15s ease, border-color .15s ease;
+}
+.trow:hover{background:var(--panel-hi)}
+.trow:focus-visible{outline:2px solid var(--c-aircraft);outline-offset:-2px}
+
+/* Threat-level matched backgrounds */
+.trow.thr-critical{
+  border-left-color:var(--t-critical);
+  background:linear-gradient(90deg, rgba(255, 45, 78, 0.16) 0%, rgba(255, 45, 78, 0.04) 100%);
+}
+.trow.thr-critical:hover{
+  background:linear-gradient(90deg, rgba(255, 45, 78, 0.26) 0%, rgba(255, 45, 78, 0.08) 100%);
+}
+.trow.thr-critical.sel{
+  border-left-color:var(--t-critical);
+  background:linear-gradient(90deg, rgba(255, 45, 78, 0.36) 0%, rgba(255, 45, 78, 0.14) 100%);
+}
+
+.trow.thr-elevated{
+  border-left-color:var(--t-elevated);
+  background:linear-gradient(90deg, rgba(255, 122, 41, 0.13) 0%, rgba(255, 122, 41, 0.03) 100%);
+}
+.trow.thr-elevated:hover{
+  background:linear-gradient(90deg, rgba(255, 122, 41, 0.22) 0%, rgba(255, 122, 41, 0.06) 100%);
+}
+.trow.thr-elevated.sel{
+  border-left-color:var(--t-elevated);
+  background:linear-gradient(90deg, rgba(255, 122, 41, 0.30) 0%, rgba(255, 122, 41, 0.10) 100%);
+}
+
+.trow.thr-monitor{
+  border-left-color:var(--t-monitor);
+  background:linear-gradient(90deg, rgba(232, 197, 71, 0.09) 0%, rgba(232, 197, 71, 0.02) 100%);
+}
+.trow.thr-monitor:hover{
+  background:linear-gradient(90deg, rgba(232, 197, 71, 0.17) 0%, rgba(232, 197, 71, 0.04) 100%);
+}
+.trow.thr-monitor.sel{
+  border-left-color:var(--t-monitor);
+  background:linear-gradient(90deg, rgba(232, 197, 71, 0.24) 0%, rgba(232, 197, 71, 0.07) 100%);
+}
+
+.trow.thr-nominal.sel{
+  background:var(--panel-lift);
+  border-left-color:var(--c-aircraft);
+}
+.trow .ico{width:30px;height:30px}
+.trow .idline{
+  font-family:var(--font-mono);font-size:12.5px;font-weight:700;letter-spacing:.01em;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.trow .statline{
+  font-family:var(--font-display);font-size:12px;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--dim);margin-top:1px;
+}
+.trow .conf{text-align:right}
+.trow .conf .n{font-family:var(--font-mono);font-size:14px;font-weight:700}
+.trow .bar{height:3px;width:52px;background:var(--line);margin-top:4px;border-radius:2px;overflow:hidden}
+.trow .bar i{display:block;height:100%;background:currentColor;transition:width .4s ease}
+
+/* ---------------------------- event log ---------------------------- */
+.eventlog{
+  flex:none;height:184px;border-top:1px solid var(--line);
+  display:flex;flex-direction:column;
+}
+.eventlog .rows{overflow-y:auto;padding:4px 0}
+.ev{display:grid;grid-template-columns:56px 1fr;gap:8px;padding:4px 14px;font-size:11.5px;line-height:1.35}
+.ev .t{font-family:var(--font-mono);color:var(--faint);font-size:11px}
+.ev .m{color:var(--dim)}
+.ev.sev-2 .m{color:var(--ink)}
+.ev.sev-3 .m{color:var(--t-critical)}
+
+/* ---------------------------- map ---------------------------- */
+.mapcol{position:relative;background:var(--void);overflow:hidden}
+#leafletMap{position:absolute;inset:0;width:100%;height:100%;z-index:1;background:var(--void)}
+.leaflet-container{background:var(--void) !important;font-family:var(--font-body) !important}
+.leaflet-control-zoom{border:1px solid var(--line) !important;background:var(--panel) !important;border-radius:2px !important;overflow:hidden;margin-left:14px !important;margin-bottom:14px !important}
+.leaflet-control-zoom a{background:var(--panel-hi) !important;color:var(--ink) !important;border-bottom:1px solid var(--line) !important;width:28px !important;height:28px !important;line-height:28px !important}
+.leaflet-control-zoom a:hover{background:var(--panel-lift) !important}
+.leaflet-control-attribution{background:rgba(16,17,20,0.85) !important;color:var(--faint) !important;font-size:9.5px !important;padding:2px 8px !important}
+.leaflet-control-attribution a{color:var(--dim) !important;text-decoration:none}
+.mapcol svg{position:absolute;inset:0;width:100%;height:100%;display:block;z-index:2;pointer-events:none}
+.overlay{position:absolute;pointer-events:none;font-family:var(--font-display);
+  letter-spacing:.14em;text-transform:uppercase;font-size:11.5px;color:var(--faint);z-index:10}
+.ov-tl{top:12px;left:14px;line-height:1.7}
+.ov-tl b{color:var(--dim);font-weight:600;font-size:12.5px;letter-spacing:.16em}
+.ov-tr{top:12px;right:14px;display:flex;gap:6px;pointer-events:auto}
+.ov-bl{bottom:12px;left:14px;display:flex;flex-direction:column;gap:5px}
+.legend-item{display:flex;align-items:center;gap:7px;font-size:11px}
+.legend-item i{width:8px;height:8px;border-radius:50%;background:currentColor;display:block}
+.ov-br{bottom:12px;right:14px;text-align:right;line-height:1.7}
+
+.map-btn{
+  font-family:var(--font-display);font-size:11px;letter-spacing:.12em;text-transform:uppercase;
+  background:rgba(16,17,20,0.85);backdrop-filter:blur(4px);color:var(--dim);
+  border:1px solid var(--line);border-radius:2px;padding:5px 9px;cursor:pointer;
+  transition:all .15s;
+}
+.map-btn:hover{color:var(--ink);border-color:var(--faint);background:var(--panel-hi)}
+.map-btn.active{color:var(--c-aircraft);border-color:var(--c-aircraft);background:rgba(53,217,240,0.12);font-weight:600}
+
+.trk{cursor:pointer;pointer-events:auto}
+.trk .hit{fill:transparent}
+.lbl{font-family:var(--font-mono);font-size:9.5px;letter-spacing:.02em}
+.lbl-sub{font-family:var(--font-mono);font-size:8.5px;fill:var(--faint)}
+
+/* ---------------------------- detail ---------------------------- */
+.detail{overflow-y:auto;flex:1;min-height:0}
+.empty{padding:40px 22px;color:var(--faint);font-size:12.5px;line-height:1.6}
+.empty b{display:block;font-family:var(--font-display);font-size:14px;letter-spacing:.16em;
+  text-transform:uppercase;color:var(--dim);margin-bottom:8px}
+
+.dblock{padding:14px 16px;border-bottom:1px solid var(--line-soft)}
+.dblock h3{
+  font-family:var(--font-display);font-size:11px;letter-spacing:.2em;
+  text-transform:uppercase;color:var(--faint);font-weight:600;margin-bottom:10px;
+}
+.verdict{display:flex;align-items:flex-start;gap:13px}
+.verdict .big{
+  font-family:var(--font-display);font-size:30px;font-weight:700;
+  letter-spacing:.06em;text-transform:uppercase;line-height:1;
+}
+.verdict .pct{font-family:var(--font-mono);font-size:26px;font-weight:700;margin-left:auto}
+.verdict-sub{font-size:11.5px;color:var(--dim);margin-top:7px;line-height:1.5}
+
+.stack{display:flex;height:9px;border-radius:2px;overflow:hidden;background:var(--line);margin:12px 0 9px}
+.stack i{display:block;height:100%;transition:width .5s ease}
+.dist{display:flex;flex-direction:column;gap:4px}
+.dist .r{display:grid;grid-template-columns:9px 1fr auto;gap:9px;align-items:center;font-size:11.5px}
+.dist .sw{width:9px;height:9px;border-radius:2px}
+.dist .nm{font-family:var(--font-display);letter-spacing:.1em;text-transform:uppercase;color:var(--dim);font-size:12px}
+.dist .vl{font-family:var(--font-mono);font-size:11.5px;color:var(--ink)}
+
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px 14px}
+.f .k{font-family:var(--font-display);font-size:10.5px;letter-spacing:.16em;
+  text-transform:uppercase;color:var(--faint);margin-bottom:2px}
+.f .v{font-family:var(--font-mono);font-size:14px;font-weight:700}
+.f .v.na{color:var(--faint);font-size:12px}
+.f .v.warn{color:var(--t-elevated)}
+
+.flags{display:flex;flex-wrap:wrap;gap:6px}
+.flag{
+  font-family:var(--font-display);font-size:11px;letter-spacing:.12em;text-transform:uppercase;
+  padding:4px 8px;border-radius:2px;border:1px solid rgba(255,122,41,.40);
+  color:var(--t-elevated);background:rgba(255,122,41,.09);
+}
+.flag.hi{border-color:rgba(255,45,78,.50);color:var(--t-critical);background:rgba(255,45,78,.10)}
+.noflags{font-size:11.5px;color:var(--faint)}
+
+.spark{width:100%;height:56px;display:block}
+.sparkcap{display:flex;justify-content:space-between;font-family:var(--font-mono);
+  font-size:10px;color:var(--faint);margin-top:4px}
+
+.acts{display:flex;gap:8px;padding:12px 16px}
+.acts .btn{flex:1}
+.btn.danger{color:var(--t-critical);border-color:rgba(255,45,78,.45)}
+.btn.danger:hover{background:rgba(255,45,78,.12);border-color:var(--t-critical)}
+
+/* ---------------------------- sensor bar ---------------------------- */
+.sensorbar{
+  background:var(--panel);border-top:1px solid var(--line);
+  display:grid;grid-template-columns:repeat(4,1fr) auto;gap:1px;
+  background-color:var(--line-soft);
+}
+.scard{background:var(--panel);padding:10px 15px;display:flex;flex-direction:column;gap:3px;min-width:0}
+.scard .top{display:flex;align-items:center;gap:8px}
+.scard .dot{width:7px;height:7px;border-radius:50%;background:var(--ok);flex:none}
+.scard .dot.off{background:var(--faint)}
+.scard .dot.deg{background:var(--t-elevated)}
+.scard .nm{font-family:var(--font-display);font-size:12.5px;letter-spacing:.16em;
+  text-transform:uppercase;color:var(--dim);font-weight:600}
+.scard .st{font-family:var(--font-mono);font-size:10px;color:var(--faint);margin-left:auto}
+.scard .read{font-size:11.5px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.scard .read b{font-family:var(--font-mono);font-weight:700;color:var(--ink)}
+.clockcard{background:var(--panel);padding:10px 18px;display:flex;align-items:center;gap:14px}
+
+/* ---------------------------- scrollbars ---------------------------- */
+::-webkit-scrollbar{width:9px;height:9px}
+::-webkit-scrollbar-track{background:var(--panel)}
+::-webkit-scrollbar-thumb{background:var(--line);border:2px solid var(--panel);border-radius:5px}
+::-webkit-scrollbar-thumb:hover{background:var(--faint)}
+
+@media (prefers-reduced-motion:reduce){
+  *{animation:none!important;transition:none!important}
+}
+@media (max-width:1180px){
+  .shell{grid-template-columns:280px minmax(0,1fr) 320px}
+}
+@media (max-width:940px){
+  body{overflow:auto}
+  .shell{grid-template-columns:1fr;grid-template-rows:auto auto 58vh auto auto auto;height:auto}
+  .mapcol{order:-1;min-height:58vh}
+  .sensorbar{grid-template-columns:1fr 1fr}
+  .clockcard{display:none}
+}
+</style>
+</head>
+<body>
+
+<div class="shell">
+
+  <!-- ======================= masthead ======================= -->
+  <header class="masthead">
+    <div class="brand">
+      <h1>AEGIS</h1>
+      <span class="sub">Airspace Classification</span>
+    </div>
+    <div class="station">København Kastrup · EKCH · Sector North</div>
+    <div class="spacer"></div>
+    <select id="scenarioSelect" class="btn" style="background:var(--panel-hi);color:var(--ink);padding:5px 8px;cursor:pointer;font-family:var(--font-display);font-size:12px;letter-spacing:.1em;">
+      <option value="scenario_radar_d1">RADAR: D1 Drone Incursion (radar_data.npy)</option>
+      <option value="scenario_radar_multiclass">RADAR: D3 vs Seagull vs Clutter</option>
+      <option value="scenario_synthetic">SYNTHETIC: Standard Briefing</option>
+    </select>
+    <div class="chip" id="feedChip" style="border-color:var(--ok);color:var(--ok)">FMCW 77 GHz RADAR</div>
+    <button class="btn" id="replayBtn">Replay scenario</button>
+    <button class="btn" id="themeToggleBtn" title="Toggle Light / Dark Mode" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+      <span id="themeIcon">☀️</span><span id="themeText">LIGHT</span>
+    </button>
+    <div class="readout">
+      <span class="k">UTC</span>
+      <span class="v" id="clock">--:--:--</span>
+    </div>
+  </header>
+
+  <!-- ======================= alert bar ======================= -->
+  <div class="alertbar quiet" id="alertBar">
+    <span class="beacon"></span>
+    <span class="headline" id="alertHead">Airspace nominal</span>
+    <span class="detail" id="alertDetail">All tracks classified within tolerance.</span>
+    <button class="btn" id="ackBtn" style="display:none">Acknowledge</button>
+  </div>
+
+  <!-- ======================= left column ======================= -->
+  <section class="col">
+    <div class="phead">
+      <h2>Active tracks</h2>
+      <span class="count" id="trackCount">0</span>
+    </div>
+    <div class="tracklist" id="trackList" role="listbox" aria-label="Active tracks"></div>
+    <div class="eventlog">
+      <div class="phead"><h2>Event log</h2></div>
+      <div class="rows" id="eventRows"></div>
+    </div>
+  </section>
+
+  <!-- ======================= map ======================= -->
+  <section class="mapcol">
+    <div id="leafletMap"></div>
+    <svg id="map" preserveAspectRatio="none" aria-label="Airspace situation display">
+      <defs>
+        <pattern id="hatch" width="7" height="7" patternTransform="rotate(45)" patternUnits="userSpaceOnUse">
+          <line x1="0" y1="0" x2="0" y2="7" stroke="#4C7FD6" stroke-width="1" opacity=".22"/>
+        </pattern>
+        <pattern id="grid" width="50" height="50" patternUnits="userSpaceOnUse">
+          <path d="M50 0 L0 0 0 50" fill="none" stroke="#191B1F" stroke-width="1"/>
+        </pattern>
+        <radialGradient id="glow">
+          <stop offset="0%" stop-color="#FF2D4E" stop-opacity=".38"/>
+          <stop offset="100%" stop-color="#FF2D4E" stop-opacity="0"/>
+        </radialGradient>
+      </defs>
+      <g id="geo"></g>
+      <g id="rings"></g>
+      <g id="tracks"></g>
+    </svg>
+
+    <div class="overlay ov-tl">
+      <b>EKCH TMA · SURVEILLANCE VOLUME</b><br>
+      55°37′N 012°39′E · 17.4 × 13.9 km
+    </div>
+
+    <div class="overlay ov-tr">
+      <button class="map-btn danger" id="btnInjectIncursion" title="Inject simulated rogue drone incursion into runway approach path" style="color:var(--t-critical);border-color:rgba(255,45,78,0.5);background:rgba(255,45,78,0.16);font-weight:700;">+ INJECT ROGUE DRONE</button>
+      <button class="map-btn active" id="btnLayerDark" title="Tactical Dark Map (CartoDB)">Dark Tactical</button>
+      <button class="map-btn" id="btnLayerSat" title="High-Res Aerial Satellite (ESRI/Google)">Satellite</button>
+      <button class="map-btn" id="btnRecenter" title="Recenter on Kastrup Airport">Center EKCH</button>
+    </div>
+
+    <div class="overlay ov-bl">
+      <div class="legend-item" style="color:var(--c-aircraft)"><i></i>Fixed wing</div>
+      <div class="legend-item" style="color:var(--c-helicopter)"><i></i>Rotary</div>
+      <div class="legend-item" style="color:var(--c-drone)"><i></i>UAS</div>
+      <div class="legend-item" style="color:var(--c-bird)"><i></i>Biological</div>
+      <div class="legend-item" style="color:var(--c-unknown)"><i></i>Unresolved</div>
+      <div class="legend-item" style="color:var(--airspace)"><i></i>Restricted 5 km</div>
+    </div>
+
+    <div class="overlay ov-br">
+      N ↑ · Interactive Pan & Zoom<br>
+      Vector = 30 s projection
+    </div>
+  </section>
+
+  <!-- ======================= detail ======================= -->
+  <section class="col">
+    <div class="phead">
+      <h2>Track analysis</h2>
+      <span class="count" id="detailId">—</span>
+    </div>
+    <div class="detail" id="detail">
+      <div class="empty">
+        <b>No track selected</b>
+        Select a track from the list or the situation display to see the full
+        classification breakdown, sensor contributions and confidence history.
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= sensor bar ======================= -->
+  <footer class="sensorbar" id="sensorBar"></footer>
+</div>
+
+<script>
+"use strict";
+
+/* =========================================================================
+   1. GEODESY & DYNAMIC MAP PROJECTION
+   ========================================================================= */
+const REF = { lat: 55.6180, lon: 12.6560 };          // EKCH aerodrome reference point
+const M_PER_DEG_LAT = 111320;
+const M_PER_DEG_LON = 111320 * Math.cos(REF.lat * Math.PI / 180);
+const PX_PER_M = 0.0575;
+const CX = 500, CY = 400;
+
+let leafletMap = null;
+let currentTileLayer = null;
+
+const BASEMAPS = {
+  dark: {
+    url: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+    options: { subdomains: 'abcd', maxZoom: 19, attribution: '&copy; OpenStreetMap &copy; CARTO' }
+  },
+  light: {
+    url: 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
+    options: { subdomains: 'abcd', maxZoom: 19, attribution: '&copy; OpenStreetMap &copy; CARTO' }
+  },
+  sat: {
+    url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+    options: { maxZoom: 19, attribution: '&copy; Esri &copy; Maxar, Earthstar Geographics' }
+  },
+  nav: {
+    url: 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+    options: { maxZoom: 19, attribution: '&copy; OpenStreetMap contributors' }
+  }
+};
+
+let currentTheme = localStorage.getItem('aegis_theme') || 'dark';
+let currentMapLayer = 'vector';
+
+function applyTheme(theme){
+  currentTheme = theme;
+  localStorage.setItem('aegis_theme', theme);
+  const isLight = (theme === 'light');
+  document.body.classList.toggle('theme-light', isLight);
+
+  const icon = document.getElementById('themeIcon');
+  const label = document.getElementById('themeText');
+  if (icon && label){
+    icon.textContent = isLight ? '🌙' : '☀️';
+    label.textContent = isLight ? 'DARK' : 'LIGHT';
+  }
+
+  const btnDark = document.getElementById('btnLayerDark');
+  if (btnDark){
+    btnDark.textContent = isLight ? 'Light Vector' : 'Dark Tactical';
+  }
+
+  if (currentMapLayer === 'vector' && leafletMap && currentTileLayer){
+    leafletMap.removeLayer(currentTileLayer);
+    const cfg = isLight ? BASEMAPS.light : BASEMAPS.dark;
+    currentTileLayer = L.tileLayer(cfg.url, cfg.options).addTo(leafletMap);
+  }
+  drawGeography();
+  renderMap();
+}
+
+function initLeaflet(){
+  if (typeof L === 'undefined') return;
+  const container = document.getElementById('leafletMap');
+  if (!container) return;
+
+  leafletMap = L.map('leafletMap', {
+    center: [REF.lat, REF.lon],
+    zoom: 12,
+    zoomControl: true,
+    attributionControl: true
+  });
+
+  const isLight = (currentTheme === 'light');
+  const initialCfg = isLight ? BASEMAPS.light : BASEMAPS.dark;
+  currentTileLayer = L.tileLayer(initialCfg.url, initialCfg.options).addTo(leafletMap);
+
+  leafletMap.on('move zoom resize', () => {
+    drawGeography();
+    renderMap();
+  });
+
+  // Layer Switchers
+  const btnDark = document.getElementById('btnLayerDark');
+  const btnSat  = document.getElementById('btnLayerSat');
+  const btnNav  = document.getElementById('btnLayerNav');
+  const btnRec  = document.getElementById('btnRecenter');
+
+  function setLayer(name, activeBtn){
+    if (!leafletMap) return;
+    currentMapLayer = name;
+    if (currentTileLayer) leafletMap.removeLayer(currentTileLayer);
+    let cfg = BASEMAPS[name];
+    if (name === 'vector') {
+      cfg = (currentTheme === 'light') ? BASEMAPS.light : BASEMAPS.dark;
+    }
+    currentTileLayer = L.tileLayer(cfg.url, cfg.options).addTo(leafletMap);
+    [btnDark, btnSat, btnNav].forEach(b => b && b.classList.remove('active'));
+    if (activeBtn) activeBtn.classList.add('active');
+  }
+
+  if (btnDark) btnDark.addEventListener('click', () => setLayer('vector', btnDark));
+  if (btnSat)  btnSat.addEventListener('click',  () => setLayer('sat',  btnSat));
+  if (btnNav)  btnNav.addEventListener('click',  () => setLayer('nav',  btnNav));
+  if (btnRec)  btnRec.addEventListener('click',  () => {
+    leafletMap.setView([REF.lat, REF.lon], 12);
+  });
+}
+
+function projPoint(lat, lon){
+  if (leafletMap){
+    const pt = leafletMap.latLngToContainerPoint([lat, lon]);
+    return { x: pt.x, y: pt.y };
+  }
+  return {
+    x: CX + (lon - REF.lon) * M_PER_DEG_LON * PX_PER_M,
+    y: CY - (lat - REF.lat) * M_PER_DEG_LAT * PX_PER_M
+  };
+}
+
+const projX = (lon, lat = REF.lat) => projPoint(lat, lon).x;
+const projY = (lat, lon = REF.lon) => projPoint(lat, lon).y;
+const metersX = lon => (lon - REF.lon) * M_PER_DEG_LON;
+const metersY = lat => (lat - REF.lat) * M_PER_DEG_LAT;
+const lonOf   = x => REF.lon + x / M_PER_DEG_LON;
+const latOf   = y => REF.lat + y / M_PER_DEG_LAT;
+
+function mToPx(m){
+  const p0 = projPoint(REF.lat, REF.lon);
+  const p1 = projPoint(REF.lat + m / M_PER_DEG_LAT, REF.lon);
+  return Math.max(1, Math.abs(p1.y - p0.y));
+}
+
+/* =========================================================================
+   2. TACTICAL RADAR OVERLAYS — range rings & restricted volume
+   ========================================================================= */
+const RUNWAYS = [
+  { name:'04L/22R', a:[12.6355,55.6118], b:[12.6595,55.6285] },
+  { name:'04R/22L', a:[12.6482,55.6058], b:[12.6712,55.6222] },
+  { name:'12/30',   a:[12.6338,55.6280], b:[12.6600,55.6152] }
+];
+
+function drawGeography(){
+  const g = document.getElementById('geo');
+  let s = '';
+
+  // Draw tactical runway centerlines
+  RUNWAYS.forEach(r => {
+    const pa = projPoint(r.a[1], r.a[0]);
+    const pb = projPoint(r.b[1], r.b[0]);
+    s += `<line x1="${pa.x.toFixed(1)}" y1="${pa.y.toFixed(1)}" x2="${pb.x.toFixed(1)}" y2="${pb.y.toFixed(1)}"
+           stroke="var(--c-aircraft)" stroke-width="2.2" stroke-linecap="square" opacity=".75"/>`;
+  });
+  
+  const pCenter = projPoint(REF.lat, REF.lon);
+  s += `<text x="${(pCenter.x+10).toFixed(1)}" y="${(pCenter.y-10).toFixed(1)}" class="lbl-sub" fill="var(--ink)" font-weight="700">EKCH / KASTRUP</text>`;
+  g.innerHTML = s;
+
+  /* range rings + the restricted volume */
+  const r = document.getElementById('rings');
+  let t = '';
+  const cx = pCenter.x, cy = pCenter.y;
+
+  [2000, 5000, 10000].forEach(m => {
+    const rad = mToPx(m);
+    t += `<circle cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}" r="${rad.toFixed(1)}" fill="none" stroke="rgba(255,255,255,0.15)" stroke-width="1" stroke-dasharray="3 3"/>`;
+    t += `<text x="${(cx + 4).toFixed(1)}" y="${(cy - rad + 12).toFixed(1)}" class="lbl-sub" fill="var(--dim)">${m/1000} KM</text>`;
+  });
+  
+  const r5k = mToPx(5000);
+  t += `<circle cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}" r="${r5k.toFixed(1)}" fill="url(#hatch)" stroke="var(--airspace)"
+         stroke-width="1.6" stroke-dasharray="9 5" opacity=".95"/>`;
+  t += `<text x="${cx.toFixed(1)}" y="${(cy - r5k - 9).toFixed(1)}" class="lbl" fill="var(--airspace)"
+         text-anchor="middle" font-weight="700">RESTRICTED — NO UAS (5 KM)</text>`;
+  r.innerHTML = t;
+}
+
+/* =========================================================================
+   3. ICONOGRAPHY — one silhouette per class, rotated to heading
+   ========================================================================= */
+function iconPath(cls){
+  switch(cls){
+    case 'aircraft':
+      return '<path d="M0,-11 L1.9,-4.6 L11,1.6 L11,3.7 L1.9,1.2 L1.9,6.4 L4.8,9 L4.8,10.4 L0,8.8 L-4.8,10.4 L-4.8,9 L-1.9,6.4 L-1.9,1.2 L-11,3.7 L-11,1.6 L-1.9,-4.6 Z"/>';
+    case 'helicopter':
+      return '<g><ellipse cx="0" cy="0" rx="3.4" ry="5"/><rect x="-1" y="4" width="2" height="7"/>'
+           + '<rect x="-4.2" y="9.6" width="8.4" height="1.8"/>'
+           + '<line x1="-11" y1="-5" x2="11" y2="-5" stroke="currentColor" stroke-width="1.5"/>'
+           + '<line x1="-11" y1="5" x2="11" y2="5" stroke="currentColor" stroke-width="1.5" opacity=".35"/></g>';
+    case 'drone':
+      return '<g><rect x="-2.6" y="-2.6" width="5.2" height="5.2" rx="1"/>'
+           + '<circle cx="-7" cy="-7" r="3.1" fill="none" stroke="currentColor" stroke-width="1.5"/>'
+           + '<circle cx="7" cy="-7" r="3.1" fill="none" stroke="currentColor" stroke-width="1.5"/>'
+           + '<circle cx="-7" cy="7" r="3.1" fill="none" stroke="currentColor" stroke-width="1.5"/>'
+           + '<circle cx="7" cy="7" r="3.1" fill="none" stroke="currentColor" stroke-width="1.5"/>'
+           + '<line x1="-4.8" y1="-4.8" x2="-2.2" y2="-2.2" stroke="currentColor" stroke-width="1.4"/>'
+           + '<line x1="4.8" y1="-4.8" x2="2.2" y2="-2.2" stroke="currentColor" stroke-width="1.4"/>'
+           + '<line x1="-4.8" y1="4.8" x2="-2.2" y2="2.2" stroke="currentColor" stroke-width="1.4"/>'
+           + '<line x1="4.8" y1="4.8" x2="2.2" y2="2.2" stroke="currentColor" stroke-width="1.4"/></g>';
+    case 'bird':
+      return '<path d="M-10,3 Q-5,-6 0,0.6 Q5,-6 10,3 Q5,-0.9 0,3.4 Q-5,-0.9 -10,3 Z"/>';
+    case 'clutter':
+      return '<g><circle cx="0" cy="0" r="2"/>'
+           + '<line x1="0" y1="0" x2="0" y2="-10" stroke="currentColor" stroke-width="1.6"/>'
+           + '<line x1="0" y1="0" x2="8.7" y2="5" stroke="currentColor" stroke-width="1.6"/>'
+           + '<line x1="0" y1="0" x2="-8.7" y2="5" stroke="currentColor" stroke-width="1.6"/></g>';
+    default:
+      return '<path d="M0,-9.5 L9.5,0 L0,9.5 L-9.5,0 Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-dasharray="3 2.5"/>';
+  }
+}
+const CLASS_COLOR = {
+  aircraft:'var(--c-aircraft)', helicopter:'var(--c-helicopter)', drone:'var(--c-drone)',
+  bird:'var(--c-bird)', clutter:'var(--c-clutter)', unknown:'var(--c-unknown)'
+};
+const CLASS_LABEL = {
+  aircraft:'Fixed wing', helicopter:'Rotary wing', drone:'UAS',
+  bird:'Biological', clutter:'Ground clutter', unknown:'Unresolved'
+};
+const THREAT_COLOR = {
+  nominal:'var(--t-nominal)', monitor:'var(--t-monitor)',
+  elevated:'var(--t-elevated)', critical:'var(--t-critical)'
+};
+const THREAT_RANK = { nominal:0, monitor:1, elevated:2, critical:3 };
+
+function iconSVG(cls, size, color){
+  const s = size / 26;
+  return `<svg viewBox="0 0 26 26" width="${size}" height="${size}" style="color:${color}">
+    <g transform="translate(13,13) scale(${(s*26/26).toFixed(3)})" fill="currentColor" stroke="none">
+      ${iconPath(cls)}
+    </g></svg>`;
+}
+
+/* =========================================================================
+   4. STATE + THE INTEGRATION POINT
+   ========================================================================= */
+const state = {
+  tracks: new Map(),      // track_id -> normalised record
+  selected: null,
+  events: [],
+  acked: new Set(),
+  simTime: 0,
+  sensorHealth: {
+    radar:    { status:'online',   label:'X-band micro-doppler' },
+    acoustic: { status:'online',   label:'Array · 4 nodes' },
+    eo_ir:    { status:'online',   label:'EO/IR turret · slewing' },
+    rf:       { status:'degraded', label:'Remote ID receiver' }
+  }
+};
+
+const FLAG_TEXT = {
+  no_remote_id:'No Remote ID',
+  erratic_kinematics:'Erratic flight',
+  restricted_airspace:'Restricted airspace',
+  rapid_descent:'Rapid descent',
+  loitering:'Loitering',
+  swarm_member:'Possible swarm',
+  approach_path_conflict:'Approach path conflict'
+};
+const SEVERE_FLAGS = new Set(['restricted_airspace','approach_path_conflict','erratic_kinematics']);
+
+/** Derive an operational threat level when the model does not supply one. */
+function deriveThreat(p){
+  if (p.threat) return p.threat;
+  const cls   = p.classification && p.classification.label;
+  const conf  = (p.classification && p.classification.confidence) || 0;
+  const flags = p.flags || [];
+  const severe = flags.filter(f => SEVERE_FLAGS.has(f)).length;
+
+  if (cls === 'drone' && conf > 0.5){
+    if (flags.includes('restricted_airspace') || severe >= 2) return 'critical';
+    if (severe >= 1 || flags.includes('no_remote_id')) return 'elevated';
+    return 'monitor';
+  }
+  if (cls === 'unknown' || conf < 0.55) return 'monitor';
+  return 'nominal';
+}
+
+/**
+ * THE INTEGRATION POINT.
+ * Feed one payload per track per update. Shape documented at the top of file.
+ */
+function ingestTrackUpdate(payload){
+  const id = payload.track_id;
+  if (!id) return;
+  const prev = state.tracks.get(id);
+
+  const rec = {
+    id,
+    ts: payload.timestamp || Date.now()/1000,
+    cls: (payload.classification && payload.classification.label) || 'unknown',
+    conf: (payload.classification && payload.classification.confidence) || 0,
+    dist: (payload.classification && payload.classification.distribution) || {},
+    kin: payload.kinematics || {},
+    ident: payload.identity || {},
+    sensors: payload.sensors || {},
+    flags: payload.flags || [],
+    threat: deriveThreat(payload),
+    history: prev ? prev.history : [],
+    firstSeen: prev ? prev.firstSeen : (payload.timestamp || Date.now()/1000)
+  };
+
+  const last = rec.history[rec.history.length - 1];
+  if (!last || rec.ts - last.t > 0.9){
+    rec.history.push({ t: rec.ts, c: rec.conf, cls: rec.cls });
+    if (rec.history.length > 70) rec.history.shift();
+  }
+
+  /* narrate meaningful transitions into the event log */
+  if (prev){
+    if (prev.cls !== rec.cls){
+      logEvent(`${id} reclassified ${CLASS_LABEL[prev.cls] || prev.cls} → ${CLASS_LABEL[rec.cls] || rec.cls} (${pct(rec.conf)})`, 2);
+    }
+    if (THREAT_RANK[rec.threat] > THREAT_RANK[prev.threat]){
+      logEvent(`${id} threat raised to ${rec.threat.toUpperCase()}`, rec.threat === 'critical' ? 3 : 2);
+      if (rec.threat === 'critical') state.acked.delete(id);
+    }
+    rec.flags.filter(f => !prev.flags.includes(f)).forEach(f => {
+      logEvent(`${id} — ${FLAG_TEXT[f] || f}`, SEVERE_FLAGS.has(f) ? 3 : 1);
+    });
+  } else {
+    logEvent(`${id} acquired · ${CLASS_LABEL[rec.cls] || rec.cls}`, 1);
+  }
+
+  state.tracks.set(id, rec);
+}
+
+function dropTrack(id){
+  if (state.tracks.delete(id)){
+    logEvent(`${id} lost — outside surveillance volume`, 1);
+    if (state.selected === id) state.selected = null;
+  }
+}
+
+function logEvent(msg, sev){
+  const d = new Date();
+  const t = `${String(d.getUTCHours()).padStart(2,'0')}:${String(d.getUTCMinutes()).padStart(2,'0')}:${String(d.getUTCSeconds()).padStart(2,'0')}`;
+  state.events.unshift({ t, msg, sev: sev || 1 });
+  if (state.events.length > 120) state.events.pop();
+}
+
+/* =========================================================================
+   5. FORMATTERS
+   ========================================================================= */
+const pct = v => `${Math.round((v || 0) * 100)}%`;
+const na  = '<span class="v na">NO DATA</span>';
+const num = (v, unit, dp) => (v === null || v === undefined || Number.isNaN(v))
+  ? na : `<span class="v">${Number(v).toFixed(dp === undefined ? 0 : dp)}<span style="color:var(--faint);font-size:11px"> ${unit || ''}</span></span>`;
+
+function rangeFromARP(kin){
+  if (kin.lat === undefined || kin.lon === undefined) return null;
+  return Math.hypot(metersX(kin.lon), metersY(kin.lat));
+}
+
+/* =========================================================================
+   6. RENDER — map
+   ========================================================================= */
+function renderMap(){
+  const g = document.getElementById('tracks');
+  const list = [...state.tracks.values()].sort((a,b) => THREAT_RANK[a.threat] - THREAT_RANK[b.threat]);
+  let s = '';
+
+  list.forEach(tr => {
+    const k = tr.kin;
+    if (k.lat === undefined || k.lon === undefined) return;
+    const pt = projPoint(k.lat, k.lon);
+    const x = pt.x, y = pt.y;
+    const col = CLASS_COLOR[tr.cls] || CLASS_COLOR.unknown;
+    const thr = THREAT_COLOR[tr.threat];
+    const sel = state.selected === tr.id;
+    const rot = (tr.cls === 'clutter' || tr.cls === 'unknown') ? 0 : (k.heading_deg || 0);
+
+    if (tr.threat === 'critical'){
+      s += `<circle cx="${x}" cy="${y}" r="46" fill="url(#glow)"/>`;
+    }
+    if (tr.threat !== 'nominal'){
+      s += `<circle cx="${x}" cy="${y}" r="19" fill="none" stroke="${thr}" stroke-width="1.3"
+             stroke-dasharray="${tr.conf < 0.6 ? '3 3' : '0'}" opacity=".85"/>`;
+    }
+    if (sel){
+      s += `<rect x="${x-25}" y="${y-25}" width="50" height="50" fill="none"
+             stroke="var(--c-aircraft)" stroke-width="1" opacity=".9"/>`;
+    }
+
+    /* 30-second velocity projection */
+    if (k.speed_ms && k.heading_deg !== undefined){
+      const rad = (k.heading_deg - 90) * Math.PI / 180;
+      const d = mToPx(k.speed_ms * 30);
+      s += `<line x1="${x}" y1="${y}" x2="${x + Math.cos(rad)*d}" y2="${y + Math.sin(rad)*d}"
+             stroke="${col}" stroke-width="1" stroke-dasharray="2 3" opacity=".55"/>`;
+    }
+
+    s += `<g class="trk" data-id="${tr.id}">
+            <g transform="translate(${x},${y}) rotate(${rot})" fill="${col}" style="color:${col}"
+               opacity="${tr.cls === 'clutter' ? .5 : 1}">${iconPath(tr.cls)}</g>
+            <circle class="hit" cx="${x}" cy="${y}" r="24"/>
+            <text class="lbl" x="${x+17}" y="${y-4}" fill="${sel ? 'var(--ink)' : col}">${tr.id}</text>
+            <text class="lbl-sub" x="${x+17}" y="${y+7}">${
+              k.alt_m !== undefined ? `FL${String(Math.round(k.alt_m*3.28084/100)).padStart(3,'0')}` : '----'
+            } ${pct(tr.conf)}</text>
+          </g>`;
+  });
+
+  g.innerHTML = s;
+  g.querySelectorAll('.trk').forEach(el => {
+    el.addEventListener('click', () => select(el.dataset.id));
+  });
+}
+
+/* =========================================================================
+   7. RENDER — track list
+   ========================================================================= */
+function renderList(){
+  const list = [...state.tracks.values()].sort((a,b) => {
+    const d = THREAT_RANK[b.threat] - THREAT_RANK[a.threat];
+    return d !== 0 ? d : a.id.localeCompare(b.id);
+  });
+  document.getElementById('trackCount').textContent = String(list.length).padStart(2,'0');
+
+  const el = document.getElementById('trackList');
+  el.innerHTML = list.map(tr => {
+    const col = CLASS_COLOR[tr.cls] || CLASS_COLOR.unknown;
+    const thr = THREAT_COLOR[tr.threat];
+    const statusWord = tr.cls === 'unknown' ? 'Classifying'
+      : tr.conf < 0.6 ? `${CLASS_LABEL[tr.cls]} · low conf`
+      : CLASS_LABEL[tr.cls];
+    return `<div class="trow thr-${tr.threat} ${state.selected===tr.id?'sel':''}"
+              data-id="${tr.id}" role="option" tabindex="0"
+              aria-selected="${state.selected===tr.id}">
+      <span class="ico">${iconSVG(tr.cls, 26, col)}</span>
+      <span>
+        <span class="idline" style="color:${tr.threat==='critical'?'var(--t-critical)':'var(--ink)'}">${tr.id}</span>
+        <span class="statline">${statusWord}</span>
+      </span>
+      <span class="conf" style="color:${thr}">
+        <span class="n">${pct(tr.conf)}</span>
+        <span class="bar"><i style="width:${Math.round(tr.conf*100)}%"></i></span>
+      </span>
+    </div>`;
+  }).join('');
+
+  el.querySelectorAll('.trow').forEach(row => {
+    row.addEventListener('click', () => select(row.dataset.id));
+    row.addEventListener('keydown', e => {
+      if (e.key === 'Enter' || e.key === ' '){ e.preventDefault(); select(row.dataset.id); }
+    });
+  });
+}
+
+/* =========================================================================
+   8. RENDER — alert bar
+   ========================================================================= */
+function renderAlert(){
+  const bar = document.getElementById('alertBar');
+  const head = document.getElementById('alertHead');
+  const det = document.getElementById('alertDetail');
+  const ack = document.getElementById('ackBtn');
+
+  const worst = [...state.tracks.values()]
+    .filter(t => THREAT_RANK[t.threat] >= 2)
+    .sort((a,b) => THREAT_RANK[b.threat] - THREAT_RANK[a.threat])[0];
+
+  bar.className = 'alertbar';
+  if (!worst){
+    bar.classList.add('quiet');
+    head.textContent = 'Airspace nominal';
+    det.textContent = 'All tracks classified within tolerance.';
+    ack.style.display = 'none';
+    return;
+  }
+
+  const acked = state.acked.has(worst.id);
+  bar.classList.add('lvl-' + worst.threat);
+  if (!acked) bar.classList.add('live');
+
+  const r = rangeFromARP(worst.kin);
+  head.textContent = worst.threat === 'critical'
+    ? `UAS incursion — ${worst.id}`
+    : `Elevated — ${worst.id}`;
+
+  const bits = [];
+  bits.push(`${CLASS_LABEL[worst.cls]} at ${pct(worst.conf)} confidence`);
+  if (r !== null) bits.push(`${(r/1000).toFixed(1)} km from ARP`);
+  if (worst.kin.alt_m !== undefined) bits.push(`${Math.round(worst.kin.alt_m)} m AGL`);
+  worst.flags.forEach(f => bits.push(FLAG_TEXT[f] || f));
+  if (acked) bits.push('ACKNOWLEDGED');
+  det.textContent = bits.join(' · ');
+
+  ack.style.display = acked ? 'none' : '';
+  ack.onclick = () => {
+    state.acked.add(worst.id);
+    logEvent(`${worst.id} alert acknowledged by operator`, 2);
+    renderAlert(); renderEvents();
+  };
+}
+
+/* =========================================================================
+   9. RENDER — detail panel
+   ========================================================================= */
+function renderDetail(){
+  const host = document.getElementById('detail');
+  const idEl = document.getElementById('detailId');
+  const tr = state.selected ? state.tracks.get(state.selected) : null;
+
+  if (!tr){
+    idEl.textContent = '—';
+    host.innerHTML = `<div class="empty"><b>No track selected</b>
+      Select a track from the list or the situation display to see the full
+      classification breakdown, sensor contributions and confidence history.</div>`;
+    return;
+  }
+  idEl.textContent = tr.id;
+
+  const col = CLASS_COLOR[tr.cls] || CLASS_COLOR.unknown;
+  const thr = THREAT_COLOR[tr.threat];
+  const k = tr.kin, ident = tr.ident;
+  const r = rangeFromARP(k);
+
+  /* --- verdict ------------------------------------------------------- */
+  const entries = Object.entries(tr.dist).sort((a,b) => b[1] - a[1]);
+  const runnerUp = entries[1];
+  const contested = runnerUp && (entries[0][1] - runnerUp[1]) < 0.15;
+
+  let verdictNote;
+  if (tr.cls === 'unknown'){
+    verdictNote = 'Insufficient agreement between sensors. Model is withholding a verdict — treat as unresolved.';
+  } else if (contested){
+    verdictNote = `Contested. ${CLASS_LABEL[runnerUp[0]]} remains plausible at ${pct(runnerUp[1])}. Do not act on this classification alone.`;
+  } else if (tr.conf < 0.7){
+    verdictNote = 'Moderate confidence. Classification may revise as the track develops.';
+  } else {
+    verdictNote = 'High confidence. Sensor readings are in agreement.';
+  }
+
+  let h = `<div class="dblock">
+    <h3>Fused verdict</h3>
+    <div class="verdict">
+      <span class="ico">${iconSVG(tr.cls, 34, col)}</span>
+      <div>
+        <div class="big" style="color:${col}">${CLASS_LABEL[tr.cls] || tr.cls}</div>
+        <div style="font-family:var(--font-display);font-size:12px;letter-spacing:.16em;
+             text-transform:uppercase;color:${thr};margin-top:3px">Threat · ${tr.threat}</div>
+      </div>
+      <span class="pct" style="color:${col}">${pct(tr.conf)}</span>
+    </div>
+    <div class="verdict-sub">${verdictNote}</div>
+  </div>`;
+
+  /* --- distribution --------------------------------------------------- */
+  h += `<div class="dblock"><h3>Class distribution</h3><div class="stack">`;
+  entries.forEach(([cls, v]) => {
+    h += `<i style="width:${(v*100).toFixed(1)}%;background:${CLASS_COLOR[cls]||'var(--faint)'}"></i>`;
+  });
+  h += `</div><div class="dist">`;
+  entries.forEach(([cls, v]) => {
+    h += `<div class="r">
+      <span class="sw" style="background:${CLASS_COLOR[cls]||'var(--faint)'}"></span>
+      <span class="nm">${CLASS_LABEL[cls] || cls}</span>
+      <span class="vl">${(v*100).toFixed(1)}%</span></div>`;
+  });
+  h += `</div></div>`;
+
+  /* --- confidence history --------------------------------------------- */
+  if (tr.history.length > 1){
+    const w = 340, hh = 56, n = tr.history.length;
+    const pts = tr.history.map((p,i) =>
+      `${(i/(n-1)*w).toFixed(1)},${(hh - p.c*(hh-6) - 3).toFixed(1)}`).join(' ');
+    h += `<div class="dblock"><h3>Confidence history</h3>
+      <svg class="spark" viewBox="0 0 ${w} ${hh}" preserveAspectRatio="none">
+        <line x1="0" y1="${hh*0.5}" x2="${w}" y2="${hh*0.5}" stroke="var(--line)" stroke-width="1" stroke-dasharray="3 4"/>
+        <polyline points="${pts}" fill="none" stroke="${col}" stroke-width="1.8"
+          vector-effect="non-scaling-stroke" stroke-linejoin="round"/>
+      </svg>
+      <div class="sparkcap"><span>${Math.round(tr.ts - tr.firstSeen)}s ago</span><span>50%</span><span>now</span></div>
+    </div>`;
+  }
+
+  /* --- micro-doppler spectrogram -------------------------------------- */
+  const spreadHz = tr.cls === 'drone' ? '76 Hz' : tr.cls === 'bird' ? '68 Hz' : tr.cls === 'clutter' ? '8 Hz' : tr.cls === 'helicopter' ? '92 Hz' : '22 Hz';
+  const harmonicType = tr.cls === 'drone' ? '4-Blade Rotor Harmonics' : tr.cls === 'bird' ? 'Wingbeat Envelope (5.4 Hz)' : tr.cls === 'clutter' ? 'Zero-Doppler Static Peak' : tr.cls === 'helicopter' ? 'Main Rotor Flashes (6.2 Hz)' : 'Turbine Modulation / Jet Centroid';
+
+  h += `<div class="dblock">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <h3>Micro-Doppler Spectrogram</h3>
+      <span style="font-family:var(--font-mono);font-size:10px;color:var(--dim)">77 GHz FMCW</span>
+    </div>
+    <div style="position:relative;border:1px solid var(--line);border-radius:2px;overflow:hidden;background:#050709">
+      <canvas id="spectrogramCanvas" width="340" height="96" style="width:100%;height:96px;display:block"></canvas>
+      <div style="display:flex;justify-content:space-between;padding:3px 8px;font-family:var(--font-mono);font-size:9px;color:var(--faint);border-top:1px solid var(--line-soft);background:var(--panel-hi)">
+        <span>-120 Hz</span>
+        <span style="color:var(--dim);font-weight:600">Doppler Centroid (0 Hz)</span>
+        <span>+120 Hz</span>
+      </div>
+    </div>
+    <div style="font-family:var(--font-mono);font-size:10.5px;color:var(--dim);margin-top:6px;display:flex;justify-content:space-between">
+      <span>Spread: <b style="color:${col}">${spreadHz}</b></span>
+      <span>Features: <b style="color:var(--ink)">${harmonicType}</b></span>
+    </div>
+  </div>`;
+
+  /* --- kinematics ------------------------------------------------------ */
+  h += `<div class="dblock"><h3>Kinematics</h3><div class="grid2">
+    <div class="f"><div class="k">Position</div>${
+      k.lat !== undefined ? `<span class="v" style="font-size:12px">${k.lat.toFixed(4)}N ${k.lon.toFixed(4)}E</span>` : na}</div>
+    <div class="f"><div class="k">Range from ARP</div>${
+      r !== null ? `<span class="v ${r < 5000 ? 'warn' : ''}">${(r/1000).toFixed(2)}<span style="color:var(--faint);font-size:11px"> km</span></span>` : na}</div>
+    <div class="f"><div class="k">Altitude AGL</div>${num(k.alt_m,'m')}</div>
+    <div class="f"><div class="k">Ground speed</div>${num(k.speed_ms,'m/s',1)}</div>
+    <div class="f"><div class="k">Heading</div>${num(k.heading_deg,'°')}</div>
+    <div class="f"><div class="k">Vertical rate</div>${num(k.vertical_rate_ms,'m/s',1)}</div>
+  </div></div>`;
+
+  /* --- identity -------------------------------------------------------- */
+  h += `<div class="dblock"><h3>Identity</h3><div class="grid2">
+    <div class="f"><div class="k">Remote ID</div>${
+      ident.remote_id ? `<span class="v" style="font-size:12px">${ident.remote_id}</span>`
+                      : `<span class="v warn" style="font-size:12px">NOT BROADCAST</span>`}</div>
+    <div class="f"><div class="k">Operator</div>${
+      ident.operator ? `<span class="v" style="font-size:12px">${ident.operator}</span>` : na}</div>
+    <div class="f"><div class="k">Airframe</div>${
+      ident.model ? `<span class="v" style="font-size:12px">${ident.model}</span>` : na}</div>
+    <div class="f"><div class="k">Est. mass</div>${num(ident.est_mass_kg,'kg',1)}</div>
+  </div></div>`;
+
+  /* --- flags ----------------------------------------------------------- */
+  h += `<div class="dblock"><h3>Behavioural flags</h3>`;
+  h += tr.flags.length
+    ? `<div class="flags">${tr.flags.map(f =>
+        `<span class="flag ${SEVERE_FLAGS.has(f)?'hi':''}">${FLAG_TEXT[f] || f}</span>`).join('')}</div>`
+    : `<div class="noflags">None raised. Track behaviour consistent with its classification.</div>`;
+  h += `</div>`;
+
+  /* --- sensor contributions -------------------------------------------- */
+  h += `<div class="dblock"><h3>Sensor contributions</h3><div class="dist">`;
+  const SLABEL = { radar:'Radar', acoustic:'Acoustic', eo_ir:'EO / IR', rf:'RF · Remote ID' };
+  ['radar','acoustic','eo_ir','rf'].forEach(sk => {
+    const s = tr.sensors[sk];
+    const on = s && s.detected;
+    h += `<div class="r" style="grid-template-columns:9px 1fr auto">
+      <span class="sw" style="background:${on ? 'var(--ok)' : 'var(--faint)'};border-radius:50%"></span>
+      <span class="nm" style="color:${on ? 'var(--dim)' : 'var(--faint)'}">${SLABEL[sk]}</span>
+      <span class="vl" style="color:${on ? 'var(--ink)' : 'var(--faint)'}">${s ? pct(s.confidence) : '—'}</span></div>`;
+    if (s && s.note){
+      h += `<div style="font-size:11px;color:var(--faint);margin:-1px 0 3px 18px">${s.note}</div>`;
+    }
+  });
+  h += `</div></div>`;
+
+  /* --- actions ---------------------------------------------------------- */
+  h += `<div class="acts">
+    <button class="btn" data-act="hold">Slew EO/IR</button>
+    <button class="btn ${tr.threat==='critical'?'danger':''}" data-act="escalate">Escalate to ATC</button>
+  </div>`;
+
+  host.innerHTML = h;
+  host.querySelectorAll('[data-act]').forEach(b => b.addEventListener('click', () => {
+    logEvent(b.dataset.act === 'hold'
+      ? `EO/IR turret slewed to ${tr.id}`
+      : `${tr.id} escalated to ATC tower — advisory issued`, 2);
+    renderEvents();
+  }));
+
+  // Render instantaneous micro-Doppler signature
+  drawSpectrogram(tr);
+}
+
+function drawSpectrogram(tr){
+  const canvas = document.getElementById('spectrogramCanvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, h = canvas.height;
+  const isLight = (currentTheme === 'light');
+
+  // Background
+  ctx.fillStyle = isLight ? '#F3F6FA' : '#07090C';
+  ctx.fillRect(0, 0, w, h);
+
+  // Frequency Grid Lines
+  ctx.strokeStyle = isLight ? '#DEE5EE' : '#1A1E24';
+  ctx.lineWidth = 1;
+  [0.2, 0.35, 0.5, 0.65, 0.8].forEach(p => {
+    ctx.beginPath(); ctx.moveTo(w * p, 0); ctx.lineTo(w * p, h); ctx.stroke();
+  });
+  [0.3, 0.6, 0.85].forEach(p => {
+    ctx.beginPath(); ctx.moveTo(0, h * p); ctx.lineTo(w, h * p); ctx.stroke();
+  });
+
+  // Zero-Doppler Center Line
+  ctx.strokeStyle = isLight ? '#B0BCCE' : '#2D343F';
+  ctx.setLineDash([2, 3]);
+  ctx.beginPath(); ctx.moveTo(w * 0.5, 0); ctx.lineTo(w * 0.5, h); ctx.stroke();
+  ctx.setLineDash([]);
+
+  const t = state.simTime || 0;
+  const cls = tr.cls;
+  const spd = (tr.kin && tr.kin.speed_ms) ? tr.kin.speed_ms : 8;
+  const centroid = Math.sin(t * 0.6) * 6 + (spd * 0.7);
+  const cx = w * 0.5 + centroid;
+
+  // Time-Frequency Waterfall Lines
+  const rows = 18;
+  const rowH = h / rows;
+
+  for (let r = 0; r < rows; r++){
+    const curT = t - r * 0.14;
+    const alpha = Math.max(0.15, 1 - (r / rows) * 0.75);
+    const y = r * rowH;
+
+    if (cls === 'drone'){
+      // 4-Rotor blade micro-Doppler harmonics
+      const spread = 54 + Math.sin(curT * 14) * 10;
+      const b1 = Math.sin(curT * 24) * spread;
+      const b2 = -Math.sin(curT * 24 + 1.3) * (spread * 0.88);
+
+      ctx.fillStyle = isLight ? `rgba(0,125,153,${0.6 * alpha})` : `rgba(53,217,240,${0.6 * alpha})`;
+      ctx.fillRect(cx - 3, y, 6, rowH - 1);
+
+      ctx.fillStyle = isLight ? `rgba(217,11,108,${0.9 * alpha})` : `rgba(255,63,164,${0.9 * alpha})`;
+      ctx.fillRect(cx + b1 - 2, y, 4, rowH - 1);
+      ctx.fillRect(cx + b2 - 2, y, 4, rowH - 1);
+      ctx.fillRect(cx - b1 - 1, y, 3, rowH - 1);
+      ctx.fillRect(cx - b2 - 1, y, 3, rowH - 1);
+
+      ctx.fillStyle = isLight ? `rgba(217,11,108,${0.2 * alpha})` : `rgba(255,63,164,${0.25 * alpha})`;
+      ctx.fillRect(cx - spread, y + 1, spread * 2, rowH - 2);
+
+    } else if (cls === 'bird'){
+      // Biological wingbeat sinusoid
+      const wingSpread = 34;
+      const flap = Math.sin(curT * 5.4) * wingSpread;
+      ctx.fillStyle = isLight ? `rgba(56,127,0,${0.85 * alpha})` : `rgba(166,226,46,${0.85 * alpha})`;
+      ctx.fillRect(cx + flap - 3, y, 6, rowH - 1);
+      ctx.fillStyle = isLight ? `rgba(56,127,0,${0.35 * alpha})` : `rgba(166,226,46,${0.35 * alpha})`;
+      ctx.fillRect(cx - 2, y, 4, rowH - 1);
+
+    } else if (cls === 'clutter'){
+      // Fixed corner reflector / clutter
+      ctx.fillStyle = isLight ? `rgba(90,99,114,${0.9 * alpha})` : `rgba(110,116,128,${0.9 * alpha})`;
+      ctx.fillRect(w * 0.5 - 2, y, 4, rowH - 1);
+
+    } else if (cls === 'aircraft'){
+      // Fixed wing jet
+      ctx.fillStyle = isLight ? `rgba(0,125,153,${0.95 * alpha})` : `rgba(53,217,240,${0.95 * alpha})`;
+      ctx.fillRect(cx - 4, y, 8, rowH - 1);
+      ctx.fillStyle = isLight ? `rgba(0,125,153,${0.25 * alpha})` : `rgba(53,217,240,${0.25 * alpha})`;
+      ctx.fillRect(cx - 16, y, 32, rowH - 1);
+
+    } else if (cls === 'helicopter'){
+      // Helicopter main rotor flashes
+      const rotor = Math.cos(curT * 12) * 72;
+      ctx.fillStyle = isLight ? `rgba(24,75,217,${0.9 * alpha})` : `rgba(108,140,255,${0.9 * alpha})`;
+      ctx.fillRect(cx + rotor - 3, y, 6, rowH - 1);
+      ctx.fillRect(cx - 3, y, 6, rowH - 1);
+
+    } else {
+      // Acquiring / Noise
+      for (let s = 0; s < 4; s++){
+        const nx = cx + (Math.random() - 0.5) * 60;
+        ctx.fillStyle = isLight ? `rgba(124,45,219,${0.4 * alpha})` : `rgba(179,107,255,${0.4 * alpha})`;
+        ctx.fillRect(nx, y, 3, rowH - 1);
+      }
+    }
+  }
+
+  // Real-time FFT Power Envelope Curve Overlay
+  ctx.strokeStyle = isLight ? '#007D99' : '#35D9F0';
+  ctx.lineWidth = 1.6;
+  ctx.beginPath();
+  for (let px = 0; px < w; px += 3){
+    const d = Math.abs(px - cx);
+    let amp = Math.exp(-Math.pow(d / 12, 2)) * 34;
+    if (cls === 'drone'){
+      amp += Math.exp(-Math.pow((d - 46) / 8, 2)) * 26;
+      amp += Math.exp(-Math.pow((d - 72) / 8, 2)) * 18;
+    } else if (cls === 'bird'){
+      amp += Math.exp(-Math.pow((d - 28) / 8, 2)) * 20;
+    }
+    const py = 36 - amp + (Math.random() - 0.5) * 3.5;
+    if (px === 0) ctx.moveTo(px, py);
+    else ctx.lineTo(px, py);
+  }
+  ctx.stroke();
+}
+
+/* =========================================================================
+   INCURSION INJECTION CONTROLLER
+   ========================================================================= */
+let injectionSeq = 1;
+
+function injectRogueDrone(customX, customY){
+  const seqNum = String(injectionSeq++).padStart(2, '0');
+  const id = `ROGUE-UAS-${seqNum}`;
+  
+  // Default location: 3.2 km Northeast right in the approach cone of Runway 22L
+  const x = (customX !== undefined) ? customX : 3200 + (Math.random() - 0.5) * 400;
+  const y = (customY !== undefined) ? customY : -2600 + (Math.random() - 0.5) * 400;
+  
+  const toField = ((Math.atan2(-x, -y) * 180 / Math.PI) + 360) % 360;
+
+  const rogueActor = {
+    id: id,
+    kind: 'drone-rogue',
+    label: 'unknown',
+    isRadar: false,
+    x: x,
+    y: y,
+    alt: 65,
+    spd: 18.5,
+    hdg: toField + (Math.random() - 0.5) * 12,
+    climb: -0.3,
+    born: state.simTime,
+    model: 'DJI Matrice 300 RTK',
+    mass: 3.6,
+    rid: null
+  };
+
+  actors.unshift(rogueActor);
+  select(id);
+  logEvent(`⚠️ [INJECTION] Simulated Rogue Drone (${id}) injected on Runway 22L approach!`, 3);
+
+  if (leafletMap){
+    leafletMap.panTo([latOf(y), lonOf(x)]);
+  }
+
+  renderList();
+  renderDetail();
+  renderAlert();
+  renderEvents();
+  renderMap();
+}
+function renderEvents(){
+  document.getElementById('eventRows').innerHTML = state.events.slice(0,40).map(e =>
+    `<div class="ev sev-${e.sev}"><span class="t">${e.t}</span><span class="m">${e.msg}</span></div>`).join('');
+}
+
+function renderSensors(){
+  const tr = state.selected ? state.tracks.get(state.selected) : null;
+  const defs = [
+    ['radar','Radar','X-band micro-doppler'],
+    ['acoustic','Acoustic','Array · 4 nodes'],
+    ['eo_ir','EO / IR','Turret · auto-slew'],
+    ['rf','RF link','Remote ID receiver']
+  ];
+  const bar = document.getElementById('sensorBar');
+  let h = defs.map(([key,name,sub]) => {
+    const health = state.sensorHealth[key];
+    const dot = health.status === 'online' ? '' : health.status === 'degraded' ? 'deg' : 'off';
+    const s = tr ? tr.sensors[key] : null;
+    const read = tr
+      ? (s && s.detected
+          ? `<b>${pct(s.confidence)}</b> · ${s.note || 'contributing'}`
+          : `<span style="color:var(--faint)">no return on ${tr.id}</span>`)
+      : sub;
+    return `<div class="scard">
+      <div class="top"><span class="dot ${dot}"></span><span class="nm">${name}</span>
+        <span class="st">${health.status.toUpperCase()}</span></div>
+      <div class="read">${read}</div></div>`;
+  }).join('');
+  h += `<div class="clockcard">
+      <div class="readout" style="align-items:flex-start">
+        <span class="k">Fusion latency</span><span class="v" style="font-size:13px">142 ms</span></div>
+      <div class="readout" style="align-items:flex-start">
+        <span class="k">Detector</span><span class="v" style="font-size:12px;color:var(--ok)">MicroDopplerCNN</span></div>
+    </div>`;
+  bar.innerHTML = h;
+}
+
+/* =========================================================================
+   11. SELECTION + CLOCK
+   ========================================================================= */
+function select(id){
+  state.selected = (state.selected === id) ? null : id;
+  renderList(); renderDetail(); renderMap(); renderSensors();
+}
+
+function tickClock(){
+  const d = new Date();
+  document.getElementById('clock').textContent =
+    `${String(d.getUTCHours()).padStart(2,'0')}:${String(d.getUTCMinutes()).padStart(2,'0')}:${String(d.getUTCSeconds()).padStart(2,'0')}`;
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+  const ids = [...state.tracks.values()]
+    .sort((a,b) => THREAT_RANK[b.threat] - THREAT_RANK[a.threat] || a.id.localeCompare(b.id))
+    .map(t => t.id);
+  if (!ids.length) return;
+  e.preventDefault();
+  const i = ids.indexOf(state.selected);
+  const next = e.key === 'ArrowDown'
+    ? ids[(i + 1) % ids.length]
+    : ids[(i - 1 + ids.length) % ids.length];
+  state.selected = next;
+  renderList(); renderDetail(); renderMap(); renderSensors();
+});
+
+/* =========================================================================
+   12. SIMULATED & RADAR FEED DRIVER
+   ========================================================================= */
+const jitter = (v, a) => v + (Math.random() - 0.5) * a;
+const clamp01 = v => Math.max(0, Math.min(1, v));
+
+function normalise(d){
+  const s = Object.values(d).reduce((a,b) => a + b, 0) || 1;
+  const o = {};
+  for (const k in d) o[k] = clamp01(d[k] / s);
+  return o;
+}
+
+let activeScenarioKey = 'scenario_radar_d1';
+let actors = [];
+
+function initScenario(key){
+  activeScenarioKey = key;
+  state.tracks.clear();
+  state.events.length = 0;
+  state.acked.clear();
+  state.selected = null;
+  state.simTime = 0;
+  nextSpawn = 3.5;
+
+  const chip = document.getElementById('feedChip');
+  if (key.startsWith('scenario_radar') && window.RADAR_SCENARIOS && window.RADAR_SCENARIOS[key]){
+    const sc = window.RADAR_SCENARIOS[key];
+    chip.textContent = 'FMCW 77 GHz RADAR';
+    chip.style.borderColor = 'var(--ok)';
+    chip.style.color = 'var(--ok)';
+    logEvent(`Loaded Radar Feed: ${sc.name}`, 2);
+    logEvent(`Surveillance active · 77 GHz FMCW micro-Doppler processor online`, 1);
+  } else {
+    chip.textContent = 'SYNTHETIC FEED';
+    chip.style.borderColor = 'var(--c-aircraft)';
+    chip.style.color = 'var(--c-aircraft)';
+    logEvent(`Loaded Synthetic Scenario · Sector EKCH`, 2);
+  }
+
+  actors = buildActorsFor(activeScenarioKey);
+  renderList(); renderDetail(); renderMap(); renderAlert(); renderEvents(); renderSensors();
+}
+
+function makeSyntheticScenario(){
+  return [
+    { id:'SAS1745', kind:'aircraft', x:-1400, y:-1100, alt:340, spd:92, hdg:222,
+      climb:9.5, born:0, model:'A320-251N', rid:'SAS1745 · SQUAWK 3421' },
+    { id:'DLH2431', kind:'aircraft', x:6800, y:5600, alt:1750, spd:104, hdg:214,
+      climb:-7.2, born:0, model:'A321-131', rid:'DLH2431 · SQUAWK 1055' },
+    { id:'HEMS-04', kind:'helicopter', x:-5200, y:3600, alt:310, spd:52, hdg:104,
+      climb:0, born:4, model:'EC135 T3', rid:'OY-HUS · HEMS PRIORITY' },
+    { id:'BRD-1102', kind:'bird', x:2600, y:-3100, alt:140, spd:13, hdg:318,
+      climb:0.3, born:2 },
+    { id:'WTG-MDG', kind:'clutter', x:1100, y:6250, alt:104, spd:0, hdg:0,
+      climb:0, born:0 },
+    { id:'UAS-0388', kind:'drone-friendly', x:-6300, y:-4200, alt:96, spd:8.5, hdg:70,
+      climb:0, born:6, model:'DJI Mavic 3 Enterprise', rid:'DK-CAA-88213',
+      operator:'Kastrup Survey ApS', mass:0.92 },
+    { id:'UAS-0421', kind:'drone-rogue', x:4200, y:-3900, alt:126, spd:9, hdg:334,
+      climb:0, born:1, model:null, rid:null, mass:null }
+  ];
+}
+
+function buildActorsFor(key){
+  if (key === 'scenario_synthetic' || !window.RADAR_SCENARIOS || !window.RADAR_SCENARIOS[key]){
+    return makeSyntheticScenario();
+  }
+  const sc = window.RADAR_SCENARIOS[key];
+  return sc.tracks.map(t => {
+    if (t.data){
+      return {
+        id: t.id,
+        kind: t.kind,
+        label: t.label,
+        isRadar: true,
+        data: t.data,
+        geo: t.geo,
+        identity: t.identity || {},
+        x: t.geo.start_x,
+        y: t.geo.start_y,
+        alt: t.geo.alt || 100,
+        spd: 0,
+        hdg: 0,
+        climb: t.geo.climb || 0,
+        born: 0
+      };
+    } else {
+      return {
+        id: t.id,
+        kind: t.kind,
+        label: t.label,
+        isRadar: false,
+        x: t.x,
+        y: t.y,
+        alt: t.alt,
+        spd: t.spd,
+        hdg: t.hdg,
+        climb: t.climb || 0,
+        born: 0,
+        model: t.model,
+        rid: t.rid
+      };
+    }
+  });
+}
+
+function classifySynthetic(a, t){
+  const age = t - a.born;
+  // All tracks initially appear as UNKNOWN / UNRESOLVED during sensor acquisition
+  if (age < 6){
+    const c = clamp01(0.35 + age * 0.03);
+    return {
+      label: 'unknown',
+      confidence: c,
+      dist: normalise({ unknown: 0.65 - age * 0.05, [a.kind === 'drone-rogue' || a.kind === 'drone-friendly' ? 'drone' : a.kind]: 0.35 }),
+      flags: []
+    };
+  }
+
+  switch(a.kind){
+    case 'aircraft': {
+      const c = clamp01(jitter(0.965, 0.02));
+      return { label:'aircraft', confidence:c,
+        dist:normalise({ aircraft:c, helicopter:0.02, drone:0.008, bird:0.004, clutter:0.002, unknown:0.006 }),
+        flags:[] };
+    }
+    case 'helicopter': {
+      const c = clamp01(jitter(0.94, 0.03));
+      return { label:'helicopter', confidence:c,
+        dist:normalise({ helicopter:c, aircraft:0.03, drone:0.015, bird:0.006, clutter:0.002, unknown:0.007 }),
+        flags:[] };
+    }
+    case 'bird': {
+      const wob = Math.sin(t / 7) * 0.14;
+      const c = clamp01(0.78 + wob);
+      return { label: c < 0.55 ? 'unknown' : 'bird', confidence:c,
+        dist:normalise({ bird:c, drone:0.16 - wob*0.4, unknown:0.05, clutter:0.02, aircraft:0.005, helicopter:0.003 }),
+        flags:[] };
+    }
+    case 'clutter': {
+      const c = clamp01(jitter(0.91, 0.02));
+      return { label:'clutter', confidence:c,
+        dist:normalise({ clutter:c, drone:0.04, bird:0.02, unknown:0.02, aircraft:0.004, helicopter:0.003 }),
+        flags:[] };
+    }
+    case 'drone-friendly': {
+      const c = clamp01(jitter(0.93, 0.02));
+      return { label:'drone', confidence:c,
+        dist:normalise({ drone:c, bird:0.03, clutter:0.015, unknown:0.015, aircraft:0.004, helicopter:0.006 }),
+        flags:[] };
+    }
+    case 'drone-rogue': {
+      const flags = [];
+      let label = 'drone';
+      let c, dist;
+
+      if (age < 12){
+        c = clamp01(jitter(0.58, 0.04));
+        dist = normalise({ drone:0.58, bird:0.28, unknown:0.09, clutter:0.03, aircraft:0.01, helicopter:0.01 });
+        flags.push('no_remote_id');
+      } else if (age < 20){
+        c = clamp01(jitter(0.78, 0.03));
+        dist = normalise({ drone:0.78, bird:0.12, unknown:0.05, clutter:0.03, aircraft:0.01, helicopter:0.01 });
+        flags.push('no_remote_id');
+      } else {
+        c = clamp01(jitter(0.92, 0.02));
+        dist = normalise({ drone:0.92, bird:0.04, unknown:0.02, clutter:0.01, aircraft:0.005, helicopter:0.005 });
+        flags.push('no_remote_id');
+      }
+      const rng = Math.hypot(a.x, a.y);
+      if (age >= 20) flags.push('erratic_kinematics');
+      if (age >= 24 && !a.holding) flags.push('rapid_descent');
+      if (rng < 5000 && label === 'drone') flags.push('restricted_airspace');
+      if (rng < 4200 && label === 'drone') flags.push('approach_path_conflict');
+      if (a.holding && label === 'drone') flags.push('loitering');
+
+      return { label, confidence:c, dist, flags };
+    }
+  }
+}
+
+function sensorsForSynthetic(a, cl, t){
+  const on = (p, note) => ({ detected:true, confidence:clamp01(jitter(p,0.05)), note });
+  const off = note => ({ detected:false, confidence:0, note });
+  const rng = Math.hypot(a.x, a.y);
+
+  switch(a.kind){
+    case 'aircraft': return {
+      radar: on(0.98,'large RCS · steady return'),
+      acoustic: rng < 6000 ? on(0.61,'turbofan band') : off('below detection range'),
+      eo_ir: rng < 9000 ? on(0.93,'airframe matched') : off('outside turret coverage'),
+      rf: on(0.99,'Mode S transponder')
+    };
+    case 'helicopter': return {
+      radar: on(0.95,'micro-doppler: main rotor 6.2 Hz'),
+      acoustic: on(0.82,'rotor blade slap'),
+      eo_ir: rng < 9000 ? on(0.88,'airframe matched') : off('outside turret coverage'),
+      rf: on(0.96,'Mode S transponder')
+    };
+    case 'bird': return {
+      radar: on(0.58,'low RCS · irregular doppler'),
+      acoustic: off('no mechanical signature'),
+      eo_ir: rng < 7000 ? on(0.71,'wingbeat detected') : off('outside turret coverage'),
+      rf: off('no emission')
+    };
+    case 'clutter': return {
+      radar: on(0.88,'fixed bearing · blade flash'),
+      acoustic: off('masked by ambient'),
+      eo_ir: off('outside turret coverage'),
+      rf: off('no emission')
+    };
+    case 'drone-friendly': return {
+      radar: on(0.79,'micro-doppler: 4 rotors'),
+      acoustic: rng < 4000 ? on(0.68,'rotor harmonics 180 Hz') : off('below detection range'),
+      eo_ir: on(0.9,'airframe matched to library'),
+      rf: on(0.97,'Remote ID valid · CAA registry hit')
+    };
+    case 'drone-rogue': {
+      const age = t - a.born;
+      return {
+        radar: on(age < 8 ? 0.52 : 0.9, age < 8 ? 'weak return · intermittent' : 'micro-doppler: 4 rotors'),
+        acoustic: age < 12 ? off('below detection range')
+                           : on(0.76, 'rotor harmonics 214 Hz'),
+        eo_ir: age < 17 ? off('turret slewing')
+                        : on(0.86, age < 23 ? 'multirotor · model pending' : 'airframe matched to library'),
+        rf: off('no Remote ID broadcast')
+      };
+    }
+  }
+}
+
+const CALLSIGNS = [
+  'SAS0912', 'NOZ4471', 'DLH0837', 'KLM1206', 'EZY8814', 'WZZ3355', 'FIN0741',
+  'BAW0810', 'RYR3190', 'AFR1244', 'ICE318', 'SWR1402', 'DAT2218', 'QTR8102'
+];
+const HELI_CALLSIGNS = ['HEMS-02', 'POLICE-1', 'SAR-104', 'WIND-08', 'OY-HJR', 'OY-HBY'];
+const DRONE_CALLSIGNS = ['UAS-0881', 'UAS-1402', 'UAS-0519', 'UAS-0924', 'UAS-2180', 'UAS-3304'];
+const BIRD_CALLSIGNS = ['FLK-084', 'BRD-1902', 'FLK-311', 'GULL-402', 'BRD-2810', 'FLK-119'];
+
+let nextSpawn = 3.5;
+
+function spawnTraffic(t){
+  if (t < nextSpawn) return;
+  nextSpawn = t + 5.0 + Math.random() * 4.0; // Spawns a new object every 5.0 - 9.0 seconds!
+  if (actors.length >= 22) return;
+
+  const roll = Math.random();
+  const bearing = Math.random() * Math.PI * 2;
+  const r = 7800 + Math.random() * 1600;
+  const x = Math.cos(bearing) * r;
+  const y = Math.sin(bearing) * r;
+  const toField = ((Math.atan2(-x, -y) * 180 / Math.PI) + 360) % 360;
+
+  if (roll < 0.42){
+    // Commercial Airliner
+    const arriving = Math.random() < 0.6;
+    const baseId = CALLSIGNS[Math.floor(Math.random() * CALLSIGNS.length)];
+    const cid = baseId + (Math.random() < 0.3 ? 'A' : '');
+    if (actors.some(a => a.id === cid)) return;
+    actors.push({
+      id: cid,
+      kind: 'aircraft',
+      label: 'aircraft',
+      isRadar: false,
+      x: arriving ? x : (Math.random() - 0.5) * 2000,
+      y: arriving ? y : (Math.random() - 0.5) * 2000,
+      alt: arriving ? 1400 + Math.random() * 600 : 180 + Math.random() * 200,
+      spd: arriving ? 88 + Math.random() * 20 : 92 + Math.random() * 18,
+      hdg: arriving ? (toField + (Math.random() - 0.5) * 30) % 360 : (toField + 160 + (Math.random() - 0.5) * 40) % 360,
+      climb: arriving ? -5.5 - Math.random() * 3 : 7.0 + Math.random() * 3.5,
+      born: t,
+      model: arriving ? 'B738' : 'A320-251N',
+      rid: 'MODE S · ' + Math.floor(1000 + Math.random() * 6000)
+    });
+  } else if (roll < 0.65){
+    // Biological Bird Flock
+    const cid = BIRD_CALLSIGNS[Math.floor(Math.random() * BIRD_CALLSIGNS.length)];
+    if (actors.some(a => a.id === cid)) return;
+    actors.push({
+      id: cid,
+      kind: 'bird',
+      label: 'bird',
+      isRadar: false,
+      x: x * 0.7,
+      y: y * 0.7,
+      alt: 60 + Math.random() * 120,
+      spd: 11 + Math.random() * 6,
+      hdg: Math.random() * 360,
+      climb: (Math.random() - 0.5) * 0.6,
+      born: t
+    });
+  } else if (roll < 0.82){
+    // Rotary Wing Helicopter
+    const cid = HELI_CALLSIGNS[Math.floor(Math.random() * HELI_CALLSIGNS.length)];
+    if (actors.some(a => a.id === cid)) return;
+    actors.push({
+      id: cid,
+      kind: 'helicopter',
+      label: 'helicopter',
+      isRadar: false,
+      x: x * 0.85,
+      y: y * 0.85,
+      alt: 220 + Math.random() * 160,
+      spd: 45 + Math.random() * 18,
+      hdg: (toField + (Math.random() - 0.5) * 40) % 360,
+      climb: (Math.random() - 0.5) * 1.5,
+      born: t,
+      model: 'EC135 T3',
+      rid: 'HEMS · OY-' + Math.floor(100 + Math.random() * 800)
+    });
+  } else {
+    // Dynamic UAV / Drone
+    const isRogue = Math.random() < 0.5;
+    const cid = DRONE_CALLSIGNS[Math.floor(Math.random() * DRONE_CALLSIGNS.length)];
+    if (actors.some(a => a.id === cid)) return;
+    actors.push({
+      id: cid,
+      kind: isRogue ? 'drone-rogue' : 'drone-friendly',
+      label: 'drone',
+      isRadar: false,
+      x: x * 0.65,
+      y: y * 0.65,
+      alt: 75 + Math.random() * 80,
+      spd: isRogue ? 16 + Math.random() * 8 : 8 + Math.random() * 5,
+      hdg: isRogue ? toField : (Math.random() * 360),
+      climb: 0,
+      born: t,
+      model: isRogue ? 'DJI Matrice 300 RTK' : 'DJI Mavic 3 Enterprise',
+      rid: isRogue ? null : 'DK-CAA-' + Math.floor(10000 + Math.random() * 80000),
+      operator: isRogue ? null : 'Kastrup Port Survey ApS',
+      mass: isRogue ? 3.6 : 0.95
+    });
+  }
+}
+
+function step(dt, t){
+  spawnTraffic(t);
+  
+  actors.forEach(a => {
+    if (t < a.born) return;
+
+    if (a.isRadar && a.data && a.data.points && a.data.points.length){
+      // Replay real radar time-series from radar_data.npy
+      const pts = a.data.points;
+      const totalDur = a.data.total_duration || pts[pts.length-1].t;
+      const relT = t % (totalDur + 5); // Loop or clamp
+      
+      // Find matching radar point
+      let pt = pts[0];
+      for (let i = 0; i < pts.length; i++){
+        if (pts[i].t <= relT) pt = pts[i];
+        else break;
+      }
+      
+      const progress = Math.min(1.0, relT / totalDur);
+      const startX = a.geo.start_x, startY = a.geo.start_y;
+      const targetX = a.geo.target_x, targetY = a.geo.target_y;
+      
+      a.x = startX + (targetX - startX) * progress;
+      a.y = startY + (targetY - startY) * progress;
+      
+      const dx = targetX - startX, dy = targetY - startY;
+      a.hdg = ((Math.atan2(dx, -dy) * 180 / Math.PI) + 360) % 360;
+      a.spd = Math.max(3.0, pt.spd * 2.5 + (Math.hypot(dx, dy) / Math.max(1, totalDur)));
+      a.alt = Math.max(25, a.geo.alt + (a.climb || 0) * relT);
+
+      const cnn = pt.cnn;
+      const rng = Math.hypot(a.x, a.y);
+      const flags = [];
+      
+      const isAcquiring = (relT < 6.0);
+      let label = isAcquiring ? 'unknown' : (cnn ? cnn.pred_label : a.label);
+      let conf = isAcquiring ? clamp01(0.35 + (relT / 6.0) * 0.18) : (cnn ? cnn.pred_conf : 0.88);
+      let dist = isAcquiring
+        ? normalise({ unknown: 0.65 - relT * 0.05, drone: cnn ? cnn.probs.drone * 0.35 : 0.1, bird: cnn ? cnn.probs.bird * 0.35 : 0.1, clutter: cnn ? cnn.probs.clutter * 0.35 : 0.1 })
+        : (cnn ? cnn.probs : normalise({ [label]: conf, unknown: 1 - conf }));
+      let radarNote = '';
+
+      if (isAcquiring){
+        radarNote = `MicroDopplerCNN: acquiring signature (${relT.toFixed(1)}s/6.0s) · spectral spread ${cnn ? cnn.spread : 60} Hz`;
+      } else if (a.kind.includes('d1') || a.kind.includes('d3')){
+        // Rogue / Incursion drone
+        radarNote = `MicroDopplerCNN: ${label.toUpperCase()} (${pct(conf)}) · spread ${cnn ? cnn.spread : 66} Hz · shift ${cnn ? cnn.centroid : -0.2} Hz`;
+        if (conf > 0.6) flags.push('no_remote_id');
+        if (rng < 5000) flags.push('restricted_airspace');
+        if (rng < 4200) flags.push('approach_path_conflict');
+        if (relT >= 18) flags.push('erratic_kinematics');
+      } else if (a.kind.includes('bird')){
+        // Biological bird
+        radarNote = `MicroDopplerCNN: ${label.toUpperCase()} (${pct(conf)}) · biological wingbeat · spread ${cnn ? cnn.spread : 67} Hz`;
+      } else if (a.kind.includes('clutter')){
+        // Corner reflector / Clutter
+        radarNote = `MicroDopplerCNN: ${label.toUpperCase()} (${pct(conf)}) · static point reflector · spread ${cnn ? cnn.spread : 9} Hz`;
+        a.spd = 0;
+      } else if (a.kind.includes('d6-friendly')){
+        // Friendly drone with Remote ID
+        radarNote = `MicroDopplerCNN: ${label.toUpperCase()} (${pct(conf)}) · spread ${cnn ? cnn.spread : 55} Hz · Remote ID verified`;
+      }
+
+      const sensors = {
+        radar: { detected: true, confidence: clamp01(conf + 0.04), note: radarNote },
+        acoustic: rng < 4500 ? { detected: true, confidence: 0.72, note: 'blade acoustic harmonic' } : { detected: false, confidence: 0, note: 'out of acoustic array range' },
+        eo_ir: rng < 6500 ? { detected: true, confidence: 0.85, note: 'turret lock · airframe confirmed' } : { detected: false, confidence: 0, note: 'outside turret coverage' },
+        rf: a.identity && a.identity.remote_id ? { detected: true, confidence: 0.98, note: 'Remote ID valid' } : { detected: false, confidence: 0, note: 'no RF / Remote ID broadcast' }
+      };
+
+      ingestTrackUpdate({
+        track_id: a.id,
+        timestamp: t,
+        classification: { label, confidence: conf, distribution: dist },
+        kinematics: {
+          lat: latOf(a.y), lon: lonOf(a.x),
+          alt_m: Math.round(a.alt), speed_ms: a.spd,
+          heading_deg: Math.round((a.hdg + 360) % 360),
+          vertical_rate_ms: a.climb || 0
+        },
+        identity: {
+          remote_id: a.identity ? a.identity.remote_id : null,
+          operator: a.identity ? a.identity.operator : null,
+          model: a.identity ? a.identity.model : null,
+          est_mass_kg: a.identity ? a.identity.mass : null
+        },
+        sensors: sensors,
+        flags: flags,
+        threat: null
+      });
+
+    } else {
+      // Standard synthetic actor logic
+      if (a.kind === 'drone-rogue'){
+        const age = t - a.born;
+        const rng = Math.hypot(a.x, a.y);
+        if (rng < 2600) a.holding = true;
+        if (a.holding){
+          a.spd = 6.5; a.hdg = (a.hdg + dt * 26) % 360; a.climb = 0;
+        } else if (age >= 20){
+          a.spd = 26; a.hdg = 313 + Math.sin(age * 1.7) * 24; a.climb = -1.3;
+        } else if (age >= 16){
+          a.spd = 15; a.hdg = 320;
+        }
+      }
+      if (a.kind === 'drone-friendly'){ a.hdg = (a.hdg + dt * 6) % 360; }
+      if (a.kind === 'bird'){ a.hdg = 318 + Math.sin(t/5)*18; }
+
+      const rad = (a.hdg - 90) * Math.PI / 180;
+      a.x += Math.cos(rad) * a.spd * dt;
+      a.y -= Math.sin(rad) * a.spd * dt;
+      a.alt = Math.max(20, a.alt + (a.climb || 0) * dt);
+
+      const cl = classifySynthetic(a, t);
+      const ident = {
+        remote_id: a.rid || null,
+        operator: a.operator || null,
+        model: (a.kind === 'drone-rogue')
+          ? ((t - a.born) >= 23 ? 'DJI Matrice 300 RTK' : null)
+          : (a.model || null),
+        est_mass_kg: (a.kind === 'drone-rogue')
+          ? ((t - a.born) >= 23 ? 3.6 : null)
+          : (a.mass !== undefined ? a.mass : null)
+      };
+
+      ingestTrackUpdate({
+        track_id: a.id,
+        timestamp: t,
+        classification: { label: cl.label, confidence: cl.confidence, distribution: cl.dist },
+        kinematics: {
+          lat: latOf(a.y), lon: lonOf(a.x),
+          alt_m: Math.round(a.alt), speed_ms: a.spd,
+          heading_deg: Math.round((a.hdg + 360) % 360),
+          vertical_rate_ms: a.climb || 0
+        },
+        identity: ident,
+        sensors: sensorsForSynthetic(a, cl, t),
+        flags: cl.flags,
+        threat: null
+      });
+    }
+
+    /* prune tracks that leave the surveillance volume */
+    if (Math.abs(a.x) > 9400 || Math.abs(a.y) > 7600){
+      dropTrack(a.id);
+      actors = actors.filter(x => x !== a);
+    }
+  });
+}
+
+/* -------------------------- boot ------------------------------------- */
+initLeaflet();
+drawGeography();
+tickClock();
+setInterval(tickClock, 1000);
+
+const SIM_DT = 0.12;
+setInterval(() => {
+  state.simTime += SIM_DT;
+  step(SIM_DT, state.simTime);
+  renderMap();
+  renderAlert();
+  const selTr = state.selected ? state.tracks.get(state.selected) : null;
+  if (selTr) drawSpectrogram(selTr);
+}, 120);
+
+/* text panels update more slowly so figures stay readable */
+setInterval(() => {
+  renderList();
+  renderDetail();
+  renderEvents();
+  renderSensors();
+}, 500);
+
+document.getElementById('scenarioSelect').addEventListener('change', (e) => {
+  initScenario(e.target.value);
+});
+
+document.getElementById('replayBtn').addEventListener('click', () => {
+  initScenario(document.getElementById('scenarioSelect').value);
+});
+
+document.getElementById('themeToggleBtn').addEventListener('click', () => {
+  applyTheme(currentTheme === 'light' ? 'dark' : 'light');
+});
+
+const btnInject = document.getElementById('btnInjectIncursion');
+if (btnInject){
+  btnInject.addEventListener('click', () => {
+    injectRogueDrone();
+  });
+}
+
+// Right click on map to spawn rogue drone at custom point
+if (leafletMap){
+  leafletMap.on('contextmenu', (e) => {
+    const customX = metersX(e.latlng.lng);
+    const customY = metersY(e.latlng.lat);
+    injectRogueDrone(customX, customY);
+  });
+}
+
+// Apply initial theme preference
+applyTheme(currentTheme);
+
+// Boot into real radar dataset scenario by default
+initScenario('scenario_radar_d1');
+logEvent('AEGIS online — fusion engine mmfuse-v0.3 attached', 2);
+
+</script>
+</body>
+</html>
