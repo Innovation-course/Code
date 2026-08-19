@@ -1,30 +1,58 @@
 import json
 import math
+import os
 import numpy as np
+import torch
+import torch.nn.functional as F
+from train_micro_doppler_cnn import MicroDopplerCNN, CLASS_NAMES
 
-def analyze_segment(vec1280):
-    """Computes micro-Doppler spectral properties from a 1280-element complex vector."""
+# Device
+device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
+
+def analyze_segment(vec1280, model, window):
+    """
+    Computes micro-Doppler spectral properties and runs inference with MicroDopplerCNN.
+    """
     mat = vec1280.reshape((5, 256))
-    win = np.hanning(256)
-    fft_res = np.fft.fftshift(np.fft.fft(mat * win, axis=1), axes=1)
+    fft_res = np.fft.fftshift(np.fft.fft(mat * window, axis=1), axes=1)
     mag = np.abs(fft_res)
     profile = np.mean(mag, axis=0)
     total_pwr = np.sum(profile) + 1e-12
     bins = np.arange(-128, 128)
     centroid = float(np.sum(bins * profile) / total_pwr)
     spread = float(np.sqrt(np.sum(((bins - centroid)**2) * profile) / total_pwr))
-    pwr_norm = profile / total_pwr
-    entropy = float(-np.sum(pwr_norm * np.log2(pwr_norm + 1e-12)))
-    peak_pwr = float(np.max(profile))
+
+    # Preprocess for CNN: log magnitude + standardize
+    rd_log = 20 * np.log10(mag + 1e-12)
+    rd_norm = (rd_log - np.mean(rd_log)) / (np.std(rd_log) + 1e-8)
+    tensor_in = torch.from_numpy(rd_norm.astype(np.float32)).unsqueeze(0).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        logits = model(tensor_in)
+        probs = F.softmax(logits, dim=1).squeeze(0).cpu().numpy()
+
+    pred_idx = int(np.argmax(probs))
+    raw_pred_label = CLASS_NAMES[pred_idx]
+    pred_conf = float(probs[pred_idx])
+
+    # Map classes to console format (human -> unknown)
+    pred_label = raw_pred_label if raw_pred_label in ['drone', 'bird', 'clutter'] else 'unknown'
+
     return {
-        "centroid": round(centroid, 2),
-        "spread": round(spread, 2),
-        "entropy": round(entropy, 2),
-        "peak_pwr": round(peak_pwr, 2)
+        "pred_label": pred_label,
+        "pred_conf": round(pred_conf, 4),
+        "probs": {
+            "drone": round(float(probs[0]), 4),
+            "bird": round(float(probs[1]), 4),
+            "clutter": round(float(probs[2]), 4),
+            "unknown": round(float(probs[3]), 4)
+        },
+        "spread": round(spread, 1),
+        "centroid": round(centroid, 1)
     }
 
-def extract_track_points(raw_data, track_idx, sample_stride=2):
-    """Extracts downsampled points with micro-Doppler metrics from a track row."""
+def extract_track_points(raw_data, track_idx, model, window, sample_stride=2):
+    """Extracts downsampled points with MicroDopplerCNN classifications from a track row."""
     row = raw_data[track_idx]
     label_raw = str(row[0][0])
     seg_matrix = row[1]
@@ -39,7 +67,7 @@ def extract_track_points(raw_data, track_idx, sample_stride=2):
         t = float(timestamps[s_idx] - t0)
         r = float(ranges[s_idx])
         vec = seg_matrix[:, s_idx]
-        metrics = analyze_segment(vec)
+        cnn_metrics = analyze_segment(vec, model, window)
         
         if s_idx > 0:
             dt = max(1e-4, float(timestamps[s_idx] - timestamps[s_idx - sample_stride]))
@@ -52,7 +80,7 @@ def extract_track_points(raw_data, track_idx, sample_stride=2):
             "t": round(t, 2),
             "r": round(r, 2),
             "spd": round(spd, 2),
-            "metrics": metrics
+            "cnn": cnn_metrics
         })
     
     return {
@@ -63,21 +91,28 @@ def extract_track_points(raw_data, track_idx, sample_stride=2):
     }
 
 def build_scenarios():
+    print(f"Using compute device: {device}")
+    print("Loading PyTorch model: micro_doppler_cnn.pth...")
+    model = MicroDopplerCNN(in_channels=1, num_classes=4).to(device)
+    model.load_state_dict(torch.load("micro_doppler_cnn.pth", map_location=device))
+    model.eval()
+
     print("Loading radar_data.npy...")
     data = np.load("radar_data.npy", allow_pickle=True)
-    
-    print("Extracting representative radar tracks...")
-    track_d1_0 = extract_track_points(data, 0, sample_stride=2)     # D1 Rogue drone (122s)
-    track_d3   = extract_track_points(data, 19, sample_stride=2)    # D3 Quadcopter (156s)
-    track_d6   = extract_track_points(data, 32, sample_stride=2)    # D6 Commercial UAV (55s)
-    track_gull = extract_track_points(data, 78, sample_stride=2)    # Seagull biological (50s)
-    track_cr   = extract_track_points(data, 111, sample_stride=2)   # Corner Reflector / Clutter (30s)
+    window = np.hanning(256)
+
+    print("Running MicroDopplerCNN inference across representative radar tracks...")
+    track_d1_0 = extract_track_points(data, 0, model, window, sample_stride=2)     # D1 Rogue drone (122s)
+    track_d3   = extract_track_points(data, 19, model, window, sample_stride=2)    # D3 Quadcopter (156s)
+    track_d6   = extract_track_points(data, 32, model, window, sample_stride=2)    # D6 Commercial UAV (55s)
+    track_gull = extract_track_points(data, 78, model, window, sample_stride=2)    # Seagull biological (50s)
+    track_cr   = extract_track_points(data, 111, model, window, sample_stride=2)   # Corner Reflector / Clutter (30s)
 
     scenarios = {
         "scenario_radar_d1": {
             "id": "scenario_radar_d1",
-            "name": "Live FMCW Radar: D1 Incursion (radar_data.npy)",
-            "description": "True FMCW 77 GHz radar track of DJI Matrice class drone (D1) penetrating EKCH restricted airspace. Features real micro-Doppler harmonics.",
+            "name": "Live FMCW Radar: D1 Incursion (MicroDopplerCNN)",
+            "description": "True FMCW 77 GHz radar track of DJI Matrice class drone (D1) penetrating EKCH restricted airspace. Classified live by trained PyTorch CNN.",
             "duration": 120,
             "tracks": [
                 {
